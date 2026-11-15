@@ -9,6 +9,7 @@ import type {} from '@deepseek-ai/dsh-api-terminal-controller'
 import type { SubprocessTerminalHandle } from '@deepseek-ai/dsh-subprocess'
 import { createProcessInspector, type ProcessIdentity } from '@deepseek-ai/dsh-subprocess-local/src/process-inspector.ts'
 import { compareOrRefreshGolden, launchWebScaffold, watchConsole, webSnapshotMode, type WebScaffold } from './scaffold.ts'
+import { installMuxProbe } from './mux.ts'
 import { openSettings, connectFreshWorkspace, saveFailureShot } from './support.ts'
 
 const expected = fileURLToPath(new URL('./expected/sidebar-terminal/running.expected.md', import.meta.url))
@@ -30,20 +31,15 @@ async function command(page: Page, text: string): Promise<void> {
 }
 
 async function controlTransport(page: Page) {
-  let blocked = false
-  let close: (() => Promise<void>) | undefined
-  await page.routeWebSocket('**/api/remote.mux', async (socket) => {
-    if (blocked) { await socket.close(); return }
-    const upstream = socket.connectToServer()
-    close = async () => { await upstream.close(); await socket.close() }
-  })
+  const mux = await installMuxProbe(page)
   return {
+    /** Refuses the next carrier before failing the open one, so every retry stays offline. */
     async disconnect() {
-      blocked = true
-      if (close === undefined) throw new Error('Window did not establish its Remote mux')
-      await close()
+      if (await mux.connections() === 0) throw new Error('Window did not establish its Remote mux')
+      await mux.refuse(true)
+      await mux.kill()
     },
-    reconnect() { blocked = false },
+    async reconnect() { await mux.refuse(false) },
   }
 }
 
@@ -530,7 +526,7 @@ describe.skipIf(process.platform === 'win32')('Web sidebar terminal', () => {
     await expect.poll(() => retains.mock.calls.every(call => call[2].aborted), { timeout: 15_000 }).toBe(true)
     await expect.poll(() => scaffold.ctx.terminalController.list(sessionId), { timeout: 15_000 }).toEqual([])
     expect(alive(original)).toBe(false)
-    transport.reconnect()
+    await transport.reconnect()
     await page.context().setOffline(false)
     const environmentReady = Promise.withResolvers<undefined>()
     const environmentUrl = new URL('/api/terminal/environment', scaffold.baseUrl).href
@@ -577,7 +573,6 @@ describe.skipIf(process.platform === 'win32')('Web sidebar terminal', () => {
     const sessionId = scaffold.ctx.agents.list()[0]!.id
     const terminalId = scaffold.ctx.terminalController.list(sessionId)[0]!.id
     const result = await page.evaluate(async ({ sessionId, terminalId }) => {
-      const socket = new WebSocket(new URL('/api/remote.mux', location.href).href.replace(/^http/u, 'ws'))
       const frames: {
         type: string
         streamId: string
@@ -592,10 +587,10 @@ describe.skipIf(process.platform === 'win32')('Web sidebar terminal', () => {
         error?: { code: string }
       }[] = []
       const waiters = new Set<() => void>()
-      socket.addEventListener('message', (event) => {
-        frames.push(JSON.parse(String(event.data)) as (typeof frames)[number])
+      const receive = (text: string) => {
+        frames.push(JSON.parse(text) as (typeof frames)[number])
         for (const wake of waiters) wake()
-      })
+      }
       const wait = async (predicate: () => boolean) => {
         if (predicate()) return
         await new Promise<void>((resolve, reject) => {
@@ -604,12 +599,51 @@ describe.skipIf(process.platform === 'win32')('Web sidebar terminal', () => {
           waiters.add(inspect)
         })
       }
-      const send = (frame: object) => { socket.send(JSON.stringify(frame)) }
+      const abort = new AbortController()
+      const downlink = await fetch('/api/remote.mux', { headers: { accept: 'text/event-stream' }, signal: abort.signal })
+      const body = downlink.body
+      const session = downlink.headers.get('x-dsh-mux-session')
+      if (!downlink.ok || body === null || session === null) throw new Error('Terminal mux failed')
+      const uplink = new URL('/api/remote.mux', location.href)
+      uplink.searchParams.set('session', session)
+      const send = (frame: object) => {
+        void fetch(uplink, {
+          method: 'POST',
+          headers: { 'content-type': 'application/x-ndjson' },
+          body: JSON.stringify(frame),
+          signal: abort.signal,
+        })
+      }
       const open = (streamId: string) => { send({ type: 'open', streamId, endpoint: 'terminal/attach', payload: { args: { agentId: sessionId, id: terminalId } } }) }
-      await new Promise<void>((resolve, reject) => {
-        socket.addEventListener('open', () => { resolve() }, { once: true })
-        socket.addEventListener('error', () => { reject(new Error('Terminal socket failed')) }, { once: true })
-      })
+      const reader = body.getReader()
+      const drain = (async () => {
+        const decoder = new TextDecoder()
+        let buffer = ''
+        let data: string[] = []
+        try {
+          for (;;) {
+            const chunk = await reader.read()
+            if (chunk.done) return
+            buffer += decoder.decode(chunk.value, { stream: true })
+            for (;;) {
+              const newline = buffer.indexOf('\n')
+              if (newline < 0) break
+              const line = buffer.slice(0, newline).replace(/\r$/u, '')
+              buffer = buffer.slice(newline + 1)
+              if (line === '') {
+                if (data.length === 0) continue
+                const text = data.join('\n')
+                data = []
+                receive(text)
+              } else if (line.startsWith('data:')) {
+                data.push(line.slice('data:'.length).replace(/^ /u, ''))
+              }
+            }
+          }
+        } catch (error) {
+          if (!abort.signal.aborted) throw error
+        }
+      })()
       try {
         open('first')
         await wait(() => frames.some(frame => frame.streamId === 'first' && frame.value?.type === 'snapshot'))
@@ -623,8 +657,9 @@ describe.skipIf(process.platform === 'win32')('Web sidebar terminal', () => {
         await wait(() => frames.some(frame => frame.streamId === 'second' && frame.type === 'error'))
         return frames
       } finally {
-        socket.close()
-        await new Promise<void>((resolve) => { socket.addEventListener('close', () => { resolve() }, { once: true }) })
+        abort.abort()
+        await reader.cancel().catch(() => {})
+        await drain
       }
     }, { sessionId, terminalId })
     const window = result.find(frame => frame.streamId === 'first' && frame.value?.type === 'snapshot')?.value?.inputWindow
@@ -691,7 +726,7 @@ describe.skipIf(process.platform === 'win32')('Web sidebar terminal', () => {
     await compareOrRefreshGolden(disconnected, await page.locator('[data-sidebar-terminal]').getByRole('status').ariaSnapshot(), webSnapshotMode())
     await page.screenshot({ path: `${shots}/disconnected.png`, fullPage: true })
     await reconnect.click()
-    transport.reconnect()
+    await transport.reconnect()
     await page.locator('[data-sidebar-terminal]').getByRole('status').waitFor({ state: 'hidden' })
     await command(page, "printf 'RECONNECTED_INPUT\\n'")
     await expect.poll(() => page.locator('.xterm-rows:visible').innerText()).toContain('RECONNECTED_INPUT')

@@ -35,7 +35,7 @@ kind: "package-reference"
 
 携带启动 Token query 的根路径请求由原 Token 交换处理：成功的 `GET /` 返回303、写入 Cookie，并重定向到 `./`；无效凭据返回401。其他路径的请求交给其路由 owner。WebApp 就绪后收集入口时，本插件向传入的基地址追加进程 Token，同时保留 authority、路径与其他 query 字段。贡献的入口允许自动打开。Token 不读取 WebApp 服务，也不拥有打印、就绪判断或原生浏览器打开器。
 
-浏览器 v1 Cookie 认证为本插件拥有的共享 Peer。`/connect` 声明匿名路由准入：Connection 检查来源，handler 随后验证启动 Token、创建 API Peer，并在 v2 Cookie 中签入其 ID。有效 v2 Cookie 通过同一 Provider 认证页面与 API 请求。Peer 的 principal 与 RemoteAccess 决定权限，不区分页面/API purpose 等级。Token 限制每个 API Peer 只有一条 `/api/remote.mux` Socket；重复关联返回409，不撤销首条连接。该 Socket 关闭时先同步撤销凭据，再释放 Peer；后续使用该 Cookie 的请求被拒绝。其他升级路由（包括 Inspector CDP）不认领该 Peer，也不在关闭时撤销它。
+浏览器 v1 Cookie 认证为本插件拥有的共享 Peer。`/connect` 声明匿名路由准入：Connection 检查来源，handler 随后验证启动 Token、创建 API Peer，并在 v2 Cookie 中签入其 ID。有效 v2 Cookie 通过同一 Provider 认证页面与 API 请求。Peer 的 principal 与 RemoteAccess 决定权限，不区分页面/API purpose 等级。Token 限制每个浏览器 API 凭据只有一条 `/api/remote.mux` mux 会话：第二个并发 `GET` 返回 409，不撤销首个会话。该响应关闭时先同步撤销凭据，再释放 Peer；后续使用该 Cookie 的请求被拒绝。其他请求监听器（包括 Inspector CDP 等其他升级路由的监听器）不认领该 Peer，也不在关闭时撤销它。
 
 签名密钥仍使用 Credentials 的 `client-connection/browser-session` grant 记录。Cookie 名称、签名 audience、有效期验证及监听器决定的 `Secure` 属性遵循既有协议。重载保留根应用的启动 Token 与尚有效 Cookie，同时创建新的插件共享 Peer。Token 激活失败允许应用在缺少此验证器时继续运行，但不允许未认证访问受保护路由。Desktop 可以同时挂载本 Provider 与私有凭据 Provider。
 
@@ -49,7 +49,7 @@ kind: "package-reference"
 
 插件准备签发器，通过 Connection 创建共享 Peer，并通过 `ctx.connection.authentication` 注册验证器：v1 Cookie 返回共享 Peer，v2 ID 验签后通过插件自己的 API Peer 映射表解析。页面与 API 调用使用相同验证。WebServer 请求监听器拥有根 Token 交换，匿名精确路由拥有 `/connect`。
 
-该路由旁的 `webserver/upgrade` 监听器委派非 mux 路径，并在 `/api/remote.mux` 上按 `apiPeers.get(peer.id) === peer` 识别自己拥有的 API Peer；浏览器共享 Peer 与其他 Provider 调用 `next()` 委派。此监听器位于路由准入后、协议处理前。Socket 关闭、错误及 upgrade 失败时，在异步释放前撤销 API 凭据。Peer 释放也会关闭其 Socket。清理幂等；Web 接线作用域移除监听器、撤销自己的 API 凭据、仅销毁自己拥有的 API Socket，并等待 Socket 关闭与 Peer 清理。迟到的中间件不能恢复已撤销的 Peer。同步 `webserver/entry-url` 监听器贡献带签名的 URL；事件和入口类型由 WebServer 声明，无需依赖 WebApp bundle。
+该路由旁的 `webserver/request` 监听器除 `GET /api/remote.mux` 外一律委派，并通过 `apiPeers` 与 `sessions` 映射识别自己拥有的 API 凭据：凭据对应的 Peer 已不存在时返回 401，第二个并发会话返回 409 并带 `connection: close`。浏览器共享 Peer、owner Cookie 与其他 Provider 调用 `next()` 委派。此监听器位于路由准入后、Gateway handler 之前。响应关闭与 handler 失败都会释放该会话认领；被 Gateway 以 200 受理的会话还会在异步释放 Peer 前撤销 API 凭据，而被 Gateway 拒绝的请求从未拥有该 Peer。Peer 释放也会关闭其会话响应。清理幂等；Web 接线作用域移除监听器、撤销自己的 API 凭据、仅销毁自己拥有的 API 会话，并等待会话关闭与 Peer 清理。迟到的中间件不能恢复已撤销的 Peer。同步 `webserver/entry-url` 监听器贡献带签名的 URL；事件和入口类型由 WebServer 声明，无需依赖 WebApp bundle。
 
 原启动 Token 寿命与 Cookie 算法保留在内部 [BrowserAuth 实现](src/browser-auth.ts)。[插件入口](src/index.ts)负责 Connection、ConnectionAuthentication 与 WebServer 接线，[内部类型](src/types.ts)描述签发器使用的 HTTP 操作。
 

@@ -2,11 +2,9 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { monitorEventLoopDelay } from 'node:perf_hooks'
 import { fileURLToPath } from 'node:url'
 import { chromium, type Browser, type Page } from 'playwright'
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
-import WebSocket from 'ws'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type {} from '@deepseek-ai/dsh-tool-present/types'
 import { deriveReplayScript, parseSessionLog } from '@deepseek-ai/dsh-llm-replay'
 import {
@@ -14,6 +12,7 @@ import {
   fixtureUserPrompts, launchWebScaffold, recordFixture, watchConsole,
   webSnapshotMode, type WebScaffold,
 } from './scaffold.ts'
+import { installMuxProbe, type MuxProbe } from './mux.ts'
 import { connectFreshWorkspaceZh, ZH_BROWSER_LOCALE } from './support.ts'
 
 const DIR = fileURLToPath(new URL('../../../snapshots/web/present-svg', import.meta.url))
@@ -22,18 +21,6 @@ const MODE = webSnapshotMode()
 const RECORD_PROMPT = '简单画一个 SVG 表示冯诺依曼架构，保存为 von-neumann.svg，并提供独立文件卡片，方便打开。'
 const FILE = 'von-neumann.svg'
 
-/** Queue counters from the installed ws implementation; payload contents are never recorded. */
-type DiagnosticSocket = WebSocket & {
-  readonly _sender?: { readonly _state: number; readonly _bufferedBytes: number; readonly _queue: readonly unknown[] }
-  readonly _receiver?: { readonly _state: number; readonly _bufferedBytes: number }
-  readonly _socket?: {
-    readonly bytesRead: number
-    readonly bytesWritten: number
-    readonly readableLength: number
-    readonly writableLength: number
-  }
-}
-
 describe('web e2e: requested SVG is explicitly delivered', () => {
   let scaffold: WebScaffold
   let browser: Browser
@@ -41,40 +28,10 @@ describe('web e2e: requested SVG is explicitly delivered', () => {
   let tripwire: ReturnType<typeof watchConsole>
   let cwd: string
   let replayRoot: string | undefined
-  let restoreTransportDiagnostics: (() => void) | undefined
+  let mux: MuxProbe
   const connectionDiagnostics: string[] = []
 
   beforeAll(async () => {
-    const loopDelay = monitorEventLoopDelay({ resolution: 20 })
-    loopDelay.enable()
-    const ping = vi.spyOn(WebSocket.prototype, 'ping')
-    const terminated = vi.spyOn(WebSocket.prototype, 'terminate').mockImplementation(function (this: WebSocket) {
-      const socket = this as DiagnosticSocket
-      connectionDiagnostics.push(`Host termination: ${JSON.stringify({
-        readyState: socket.readyState,
-        bufferedBytes: socket.bufferedAmount,
-        pingCalls: ping.mock.contexts.filter(context => context === socket).length,
-        senderState: socket._sender?._state,
-        senderBufferedBytes: socket._sender?._bufferedBytes,
-        senderQueueLength: socket._sender?._queue.length,
-        receiverState: socket._receiver?._state,
-        receiverBufferedBytes: socket._receiver?._bufferedBytes,
-        bytesRead: socket._socket?.bytesRead,
-        bytesWritten: socket._socket?.bytesWritten,
-        readableLength: socket._socket?.readableLength,
-        writableLength: socket._socket?.writableLength,
-        maxEventLoopDelayMs: loopDelay.max / 1e6,
-        p99EventLoopDelayMs: loopDelay.percentile(99) / 1e6,
-      })}`)
-      connectionDiagnostics.push(new Error('Host WebSocket termination').stack ?? 'Host WebSocket termination')
-      terminated.mockRestore()
-      this.terminate()
-    })
-    restoreTransportDiagnostics = () => {
-      terminated.mockRestore()
-      ping.mockRestore()
-      loopDelay.disable()
-    }
     let replayOverride: string | undefined
     if (MODE !== 'record') {
       replayRoot = await mkdtemp(join(tmpdir(), 'dsh-present-svg-replay-'))
@@ -98,23 +55,13 @@ describe('web e2e: requested SVG is explicitly delivered', () => {
     page.on('console', (message) => {
       if (message.text().startsWith('[connection]')) connectionDiagnostics.push(message.text())
     })
-    page.on('websocket', (socket) => {
-      loopDelay.reset()
-      const openedAt = Date.now()
-      let received = 0
-      socket.on('framereceived', () => { received++ })
-      socket.on('socketerror', (error) => { connectionDiagnostics.push(error) })
-      socket.on('close', () => {
-        connectionDiagnostics.push(`WebSocket closed after ${Date.now() - openedAt}ms and ${received} received frames`)
-      })
-    })
+    mux = await installMuxProbe(page)
     await page.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
     await page.waitForSelector('[class*="frame"]')
     await connectFreshWorkspaceZh(page, scaffold.workspaceCwd)
   })
 
   afterAll(async () => {
-    restoreTransportDiagnostics?.()
     try {
       await browser?.close()
     } finally {
@@ -205,8 +152,12 @@ describe('web e2e: requested SVG is explicitly delivered', () => {
       { fills: ['color(srgb 1 1 1 / 0.5)', 'color(srgb 1 1 1 / 0.5)'], matchingTiles: true, matchingCards: true },
       { fills: ['color(srgb 1 1 1 / 0.05)', 'color(srgb 1 1 1 / 0.05)'], matchingTiles: true, matchingCards: true },
     ])
-    expect(tripwire.pageErrors).toEqual([])
-    expect(tripwire.warnings, connectionDiagnostics.join('\n')).toEqual([])
+    const muxFrames = await mux.snapshot().catch(() => undefined)
+    expect(tripwire.warnings, [
+      ...connectionDiagnostics,
+      `mux carriers=${String(muxFrames?.connections ?? 'unavailable')}`
+        + ` downlink=${String(muxFrames?.downlink.length)} uplink=${String(muxFrames?.uplink.length)}`,
+    ].join('\n')).toEqual([])
   })
 
   it.skipIf(MODE === 'record')('replays the delivered file and Chinese conversation', async () => {

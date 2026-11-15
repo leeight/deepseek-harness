@@ -1,4 +1,4 @@
-/** Connect lifecycle and event ownership through real Loader, HTTP and WebSocket composition. */
+/** Connect lifecycle and event ownership through real Loader, HTTP and the Remote stream mux. */
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
@@ -24,12 +24,18 @@ import WebSocket, { WebSocketServer } from 'ws'
 import { z } from 'zod'
 import { parseRemoteStreamServerMessage, type RemoteStreamServerMessage } from '../src/stream-protocol.ts'
 import { RemoteStreamMuxServer } from '../src/stream-server.ts'
+import { MuxSocket } from './mux-socket.ts'
 import OperatorConnectFixture from './operator-connect-fixture.ts'
 
 interface SocketClient {
-  readonly socket: WebSocket
+  readonly socket: MuxSocket
   readonly closed: Promise<void>
   readonly frames: RemoteStreamServerMessage[]
+  readonly errors: Error[]
+}
+interface UpgradeClient {
+  readonly socket: WebSocket
+  readonly closed: Promise<void>
   readonly errors: Error[]
 }
 interface Host {
@@ -40,6 +46,7 @@ interface Host {
 const roots: string[] = []
 const hosts: Host[] = []
 const clients: SocketClient[] = []
+const upgrades: UpgradeClient[] = []
 const readySchema = z.object({ type: z.literal('ready'), clientId: z.string(), host: z.object({ home: z.string() }) })
 const deliverySchema = z.object({
   type: z.literal('waterfall'), eventId: z.string(), request: z.object({ prompt: z.string() }),
@@ -50,10 +57,14 @@ afterEach(async () => {
     host.fixture.streamCleanup.resolve(undefined)
     for (const finish of host.fixture.holds.values()) finish()
   }
-  await Promise.all(clients.splice(0).map(async (client) => {
+  for (const client of clients.splice(0)) {
+    if (client.socket.readyState !== MuxSocket.CLOSED) client.socket.terminate()
+    await client.closed
+  }
+  for (const client of upgrades.splice(0)) {
     if (client.socket.readyState !== WebSocket.CLOSED) client.socket.terminate()
     await client.closed
-  }))
+  }
   await Promise.all(hosts.splice(0).map(host => host.ctx.fiber.dispose()))
   for (const root of roots.splice(0)) {
     if (!isAbsolute(root) || dirname(root) !== resolve(tmpdir()) || !basename(root).startsWith('dsh-operator-connect-')) {
@@ -108,15 +119,14 @@ describe('operator connect through Loader composition', () => {
     await success(host, cookie, 'fixture/identity', { label: 'non-mux-peer' })
     const peer = call(host, 'non-mux-peer').peer
 
-    const first = socketClient(host, cookie, '/inspector/devtools/cdp')
+    const first = upgradeClient(host, cookie, '/inspector/devtools/cdp')
     await once(first.socket, 'open')
-    const api = socketClient(host, cookie, '/api/remote.mux?fixture=scope')
-    await once(api.socket, 'open')
+    const api = await mux(host, cookie, '/api/remote.mux?fixture=scope')
     await close(first)
     expect(peer.signal.aborted).toBe(false)
     await success(host, cookie, 'fixture/identity', { label: 'after-cdp-close' })
 
-    const second = socketClient(host, cookie, '/inspector/devtools/cdp')
+    const second = upgradeClient(host, cookie, '/inspector/devtools/cdp')
     await once(second.socket, 'open')
     await close(second)
     expect(peers).toEqual([peer, peer])
@@ -141,32 +151,19 @@ describe('operator connect through Loader composition', () => {
     } finally { await unregister() }
   })
 
-  it('rejects a WebSocket upgrade with 503 when authentication providers fail', async () => {
+  it('refuses the downlink with 503 when authentication providers fail', async () => {
     const host = await boot()
     const failure = new Error('fixture authentication unavailable')
     const authenticate = vi.fn(() => { throw failure })
     const unregister = host.ctx.connection.authentication.register({ authenticate })
     try {
-      const client = socketClient(host, 'unrecognized=credential')
-      const response = await new Promise<IncomingMessage>((resolve, reject) => {
-        client.socket.once('unexpected-response', (_request, response) => { resolve(response) })
-        client.socket.once('open', () => { reject(new Error('unavailable authentication admitted the upgrade')) })
-        client.socket.once('error', reject)
+      const response = await fetch(`${host.origin}/api/remote.mux`, {
+        headers: { cookie: 'unrecognized=credential', accept: 'text/event-stream' },
       })
-      const chunks: Buffer[] = []
-      response.on('data', (chunk: Buffer) => { chunks.push(chunk) })
-      await once(response, 'end')
-      client.socket.terminate()
-      await client.closed
-
-      expect(response.statusCode).toBe(503)
-      expect(response.statusMessage).toBe('Service Unavailable')
-      expect(response.headers).toMatchObject({
-        connection: 'close',
-        'content-type': 'text/plain; charset=utf-8',
-        'content-length': String(Buffer.byteLength('service unavailable')),
-      })
-      expect(Buffer.concat(chunks).toString('utf8')).toBe('service unavailable')
+      expect(response.status).toBe(503)
+      expect(response.headers.get('cache-control')).toBe('no-store')
+      expect(response.headers.get('x-dsh-mux-session')).toBeNull()
+      expect(await response.text()).toBe('authentication unavailable')
       expect(authenticate).toHaveBeenCalledOnce()
       expect(host.fixture.calls.size).toBe(0)
     } finally {
@@ -204,26 +201,39 @@ describe('operator connect through Loader composition', () => {
     }
   })
 
-  it.each([false, true])('releases admission when the socket is destroyed before upgrade (closed: %s)', async (alreadyClosed) => {
+  it.each([false, true])('frees the mux session when the request socket dies before the downlink is claimed (already closed: %s)', async (alreadyClosed) => {
     const host = await boot()
     const cookie = await exchange(host, 'none')
-    const remove = host.ctx.on('webserver/upgrade', async (_request, socket, _head, _peer, next) => {
-      const closed = new Promise<void>((resolve) => { socket.once('close', () => { resolve() }) })
-      socket.destroy()
+    await success(host, cookie, 'fixture/identity', { label: 'before-destroy' })
+    const first = call(host, 'before-destroy').peer
+    let armed = true
+    const remove = host.ctx.on('webserver/request', async (request, _response, next) => {
+      if (!armed || request.url?.startsWith('/api/remote.mux') !== true) {
+        await next()
+        return
+      }
+      armed = false
+      expect(host.ctx.connection.admit({ headers: { host: new URL(host.origin).host, cookie } }))
+        .toMatchObject({ peer: first })
+      const closed = new Promise<void>((resolve) => { request.socket.once('close', () => { resolve() }) })
+      request.socket.destroy()
       if (alreadyClosed) await closed
       await next()
     }, { prepend: true })
-    const upgrade = vi.spyOn(RemoteStreamMuxServer.prototype, 'handleUpgrade')
+    const downlink = vi.spyOn(RemoteStreamMuxServer.prototype, 'handleDownlink')
     try {
       const client = socketClient(host, cookie)
       await client.closed
-      expect(client.socket.readyState).toBe(WebSocket.CLOSED)
-      expect(upgrade).not.toHaveBeenCalled()
-      expect((await rpc(host, cookie, 'fixture/identity', { label: 'refused' })).status).toBe(401)
-      expect(host.fixture.calls.has('refused')).toBe(false)
+      expect(client.socket.readyState).toBe(MuxSocket.CLOSED)
+      expect(client.socket.sessionId).toBeUndefined()
+      expect(downlink).not.toHaveBeenCalled()
+      // A request that never opened a downlink owns no Peer, so the credential stays admitted
+      // and the freed session slot accepts the next downlink.
+      await success(host, cookie, 'fixture/identity', { label: 'after' })
+      await close(await mux(host, cookie))
     } finally {
       remove()
-      upgrade.mockRestore()
+      downlink.mockRestore()
     }
   })
 
@@ -235,43 +245,17 @@ describe('operator connect through Loader composition', () => {
     })
     const remove = host.ctx.webServer.registerUpgrade({ path: '/anonymous-upgrade', auth: 'anonymous', handler })
     try {
-      const client = socketClient(host, '', '/anonymous-upgrade')
+      const client = upgradeClient(host, '', '/anonymous-upgrade')
       await client.closed
       expect(handler).toHaveBeenCalledOnce()
     } finally { remove() }
   })
 
-  it('refuses a Token Peer aborted between authentication and socket claim', async () => {
+  it('refuses the downlink and keeps the credential when the stream handler throws', async () => {
     const host = await boot()
     const cookie = await exchange(host, 'none')
-    await success(host, cookie, 'fixture/identity', { label: 'abort-before-claim' })
-    const peer = call(host, 'abort-before-claim').peer
-    const lifetime = new AbortController()
-    const remove = host.ctx.on('webserver/upgrade', async (_request, _socket, _head, admittedPeer, next) => {
-      expect(admittedPeer).toBe(peer)
-      Object.defineProperty(peer, 'signal', { value: lifetime.signal })
-      lifetime.abort()
-      await next()
-    }, { prepend: true })
-    const upgrade = vi.spyOn(RemoteStreamMuxServer.prototype, 'handleUpgrade')
-    try {
-      const client = socketClient(host, cookie)
-      await client.closed
-      expect(upgrade).not.toHaveBeenCalled()
-      expect((await rpc(host, cookie, 'fixture/identity', { label: 'refused' })).status).toBe(401)
-      expect(host.fixture.calls.has('refused')).toBe(false)
-    } finally {
-      remove()
-      upgrade.mockRestore()
-      await peer.dispose()
-    }
-  })
-
-  it('releases admission and closes the socket when the WebSocket upgrade throws', async () => {
-    const host = await boot()
-    const cookie = await exchange(host, 'none')
-    const failure = new Error('fixture WebSocket upgrade failure')
-    const upgrade = vi.spyOn(RemoteStreamMuxServer.prototype, 'handleUpgrade').mockImplementationOnce(() => {
+    const failure = new Error('fixture Remote stream downlink failure')
+    const downlink = vi.spyOn(RemoteStreamMuxServer.prototype, 'handleDownlink').mockImplementationOnce(() => {
       throw failure
     })
     const report = vi.fn()
@@ -279,63 +263,47 @@ describe('operator connect through Loader composition', () => {
     try {
       const client = socketClient(host, cookie)
       await client.closed
-      expect(client.socket.readyState).toBe(WebSocket.CLOSED)
+      expect(client.socket.readyState).toBe(MuxSocket.CLOSED)
+      expect(client.socket.sessionId).toBeUndefined()
+      expect(client.errors.map(error => error.message)).toEqual(['fixture mux downlink refused with status 400'])
       await vi.waitFor(() => { expect(report).toHaveBeenCalledWith(expect.objectContaining({ type: 'warn', args: [failure] })) })
-      expect((await rpc(host, cookie, 'fixture/identity', { label: 'refused' })).status).toBe(401)
-      expect(host.fixture.calls.has('refused')).toBe(false)
+      // A refused downlink never owned the Peer, so the credential stays admitted.
+      await success(host, cookie, 'fixture/identity', { label: 'after' })
       await close(await mux(host, await exchange(host, 'none')))
     } finally {
-      upgrade.mockRestore()
+      downlink.mockRestore()
       await remove()
     }
   })
 
-  it('revokes on socket error synchronously and refuses an already-authenticated late upgrade', async () => {
+  it('refuses admission while a failed downlink is still releasing its Peer', async () => {
     const host = await boot()
     const cookie = await exchange(host, 'none')
     await success(host, cookie, 'fixture/identity', { label: 'error-owner' })
     const peer = call(host, 'error-owner').peer
-    const captured = Promise.withResolvers<Duplex>()
-    host.ctx.on('webserver/upgrade', async (_request, socket, _head, _peer, next) => {
-      captured.resolve(socket)
-      await next()
-    })
     const first = await mux(host, cookie)
-    const socket = await captured.promise
-    const entered = Promise.withResolvers<undefined>()
-    const resume = Promise.withResolvers<undefined>()
-    const cleaned = Promise.withResolvers<undefined>()
+    const finish = Promise.withResolvers<undefined>()
     const dispose = peer.dispose.bind(peer)
     const disposing = vi.spyOn(peer, 'dispose').mockImplementation(async () => {
-      await cleaned.promise
+      await finish.promise
       await dispose()
     })
-    host.ctx.on('webserver/upgrade', async (_request, _socket, _head, _peer, next) => {
-      entered.resolve(undefined)
-      await resume.promise
-      await next()
-    }, { prepend: true })
-    const late = socketClient(host, cookie)
-    await entered.promise
     try {
-      socket.emit('error', new Error('fixture socket error'))
-      expect(host.ctx.connection.admit({ headers: { host: new URL(host.origin).host, cookie } }))
-        .toEqual({ rejection: 401 })
+      await close(first)
+      await vi.waitFor(() => {
+        expect(host.ctx.connection.admit({ headers: { host: new URL(host.origin).host, cookie } }))
+          .toEqual({ rejection: 401 })
+      })
       expect(peer.signal.aborted).toBe(false)
-      resume.resolve(undefined)
-      await late.closed
-      expect(late.socket.readyState).toBe(WebSocket.CLOSED)
-      await first.closed
       expect(disposing).toHaveBeenCalledOnce()
     } finally {
-      resume.resolve(undefined)
-      cleaned.resolve(undefined)
-      await dispose()
+      finish.resolve(undefined)
       disposing.mockRestore()
     }
+    await vi.waitFor(() => { expect(peer.signal.aborted).toBe(true) })
   })
 
-  it('awaits Token-owned socket cleanup on unload without claiming another provider socket', async () => {
+  it('awaits Token-owned downlink cleanup on unload without claiming another provider downlink', async () => {
     const host = await boot()
     const cookie = await exchange(host, 'none')
     await success(host, cookie, 'fixture/identity', { label: 'unload-owner' })
@@ -356,7 +324,11 @@ describe('operator connect through Loader composition', () => {
     if (token?.fiber === undefined) throw new Error('Token provider did not activate')
     const entered = Promise.withResolvers<undefined>()
     const resume = Promise.withResolvers<undefined>()
-    host.ctx.on('webserver/upgrade', async (_request, _socket, _head, _peer, next) => {
+    const remove = host.ctx.on('webserver/request', async (request, _response, next) => {
+      if (request.url?.startsWith('/api/remote.mux') !== true) {
+        await next()
+        return
+      }
       entered.resolve(undefined)
       await resume.promise
       await next()
@@ -370,14 +342,16 @@ describe('operator connect through Loader composition', () => {
       expect(settled).toBe(false)
       resume.resolve(undefined)
       await late.closed
-      expect(late.socket.readyState).toBe(WebSocket.CLOSED)
-      expect(other.socket.readyState).toBe(WebSocket.OPEN)
+      expect(late.socket.readyState).toBe(MuxSocket.CLOSED)
+      expect(late.socket.sessionId).toBeUndefined()
+      expect(other.socket.readyState).toBe(MuxSocket.OPEN)
       expect(external.signal.aborted).toBe(false)
       expect(host.ctx.connection.admit({ headers: { host: new URL(host.origin).host, cookie } }))
         .toEqual({ rejection: 401 })
     } finally {
       resume.resolve(undefined)
       finish.resolve(undefined)
+      remove()
       await unloading
       disposing.mockRestore()
     }
@@ -386,7 +360,7 @@ describe('operator connect through Loader composition', () => {
     await external.dispose()
   })
 
-  it('lets an admitted unary finish after its lifecycle socket closes', async () => {
+  it('lets an admitted unary finish after its lifecycle downlink closes', async () => {
     const host = await boot()
     const cookie = await exchange(host, 'none')
     const client = await mux(host, cookie)
@@ -491,23 +465,29 @@ async function exchange(host: Host, mode: 'html' | 'none' | 'answer'): Promise<s
 }
 
 function socketClient(host: Host, cookie: string, path = '/api/remote.mux'): SocketClient {
-  const socket = new WebSocket(`${host.origin.replace('http:', 'ws:')}${path}`, { headers: { cookie } })
+  const socket = new MuxSocket(`${host.origin}${path}`, { headers: { cookie } })
   const closed = new Promise<void>((resolve) => { socket.once('close', () => { resolve() }) })
   const frames: RemoteStreamServerMessage[] = []
   const errors: Error[] = []
-  socket.on('error', error => errors.push(error))
-  socket.on('message', (data) => {
-    const text = Array.isArray(data) ? Buffer.concat(data).toString('utf8')
-      : Buffer.from(data instanceof ArrayBuffer ? new Uint8Array(data) : data).toString('utf8')
-    frames.push(parseRemoteStreamServerMessage(text))
-  })
+  socket.on('error', (error: Error) => errors.push(error))
+  socket.on('message', (text: string) => { frames.push(parseRemoteStreamServerMessage(text)) })
   const client = { socket, closed, frames, errors }
   clients.push(client)
   return client
 }
 
-async function mux(host: Host, cookie: string): Promise<SocketClient> {
-  const client = socketClient(host, cookie)
+function upgradeClient(host: Host, cookie: string, path = '/api/remote.mux'): UpgradeClient {
+  const socket = new WebSocket(`${host.origin.replace('http:', 'ws:')}${path}`, { headers: { cookie } })
+  const closed = new Promise<void>((resolve) => { socket.once('close', () => { resolve() }) })
+  const errors: Error[] = []
+  socket.on('error', (error: Error) => errors.push(error))
+  const client = { socket, closed, errors }
+  upgrades.push(client)
+  return client
+}
+
+async function mux(host: Host, cookie: string, path = '/api/remote.mux'): Promise<SocketClient> {
+  const client = socketClient(host, cookie, path)
   await once(client.socket, 'open')
   return client
 }
@@ -516,7 +496,7 @@ async function refusedMux(host: Host, cookie: string): Promise<number> {
   const client = socketClient(host, cookie)
   const status = await new Promise<number>((resolve, reject) => {
     client.socket.once('open', () => { reject(new Error('forbidden Mux was admitted')) })
-    client.socket.once('unexpected-response', (_request, response) => {
+    client.socket.once('unexpected-response', (_request: unknown, response: { resume(): void; statusCode?: number }) => {
       response.resume()
       resolve(response.statusCode ?? 0)
       client.socket.terminate()
@@ -527,7 +507,7 @@ async function refusedMux(host: Host, cookie: string): Promise<number> {
   return status
 }
 
-async function close(client: SocketClient): Promise<void> {
+async function close(client: SocketClient | UpgradeClient): Promise<void> {
   client.socket.close()
   await client.closed
   expect(client.errors).toEqual([])

@@ -29,6 +29,7 @@ import {
   RemoteStreamMuxClient,
 } from './stream-client.ts'
 import { ClientRemoteEvents } from './remote-events.ts'
+import { REMOTE_STREAM_SESSION_HEADER, REMOTE_STREAM_SESSION_PARAM } from '../stream-protocol.ts'
 import {
   RemoteStream,
   type RemoteStreamOptions,
@@ -158,7 +159,10 @@ class ClientRemoteService extends Service implements ClientRemote {
     const connection = ctx.get('connection') as ConnectionHandle
     this.connection = connection
     this.streams = new RemoteStreamMuxClient(
-      path => connection.openWebSocket(path),
+      path => connection.openStreamMux({
+        path,
+        session: { header: REMOTE_STREAM_SESSION_HEADER, query: REMOTE_STREAM_SESSION_PARAM },
+      }),
       connection.interactions === 'answer',
     )
     if (connection.interactions === 'answer') {

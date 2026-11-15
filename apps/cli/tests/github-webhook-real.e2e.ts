@@ -12,9 +12,9 @@ import { dirname, join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
-import WebSocket from 'ws'
 import { initProfile } from '@deepseek-ai/dsh-app-boot'
 import { PROFILE_TEMPLATES } from '@deepseek-ai/dsh-official-bundles'
+import { openMuxCarrier } from './mux-carrier.ts'
 
 const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url))
 const BUILT_BIN = join(REPO_ROOT, 'apps/cli/lib/bin.js')
@@ -162,53 +162,21 @@ async function openingStreamItem(
   accepts: (value: unknown) => boolean,
 ): Promise<Record<string, unknown>> {
   const authenticated = await authenticatedWeb(baseUrl)
-  const socket = new WebSocket(`${authenticated.origin.replace(/^http/u, 'ws')}/api/remote.mux`, {
-    headers: { cookie: authenticated.cookie },
+  const carrier = await openMuxCarrier(`${authenticated.origin}/api/remote.mux`, {
+    cookie: authenticated.cookie,
   })
   const streamId = `github-webhook-real-${endpoint}-${randomUUID()}`
   try {
-    await new Promise<void>((resolve, reject) => {
-      const cleanup = (): void => {
-        socket.removeEventListener('open', opened)
-        socket.removeEventListener('error', failed)
-        socket.removeEventListener('close', closed)
-      }
-      const opened = (): void => {
-        cleanup()
-        resolve()
-      }
-      const failed = (): void => {
-        cleanup()
-        reject(new Error(`${endpoint} carrier failed before opening`))
-      }
-      const closed = (): void => {
-        cleanup()
-        reject(new Error(`${endpoint} carrier closed before opening`))
-      }
-      socket.addEventListener('open', opened)
-      socket.addEventListener('error', failed)
-      socket.addEventListener('close', closed)
-    })
     return await new Promise<Record<string, unknown>>((resolve, reject) => {
       const timer = setTimeout(() => { finish(new Error(`${endpoint} did not publish its opening item`)) }, 10_000)
-      const cleanup = (): void => {
+      const finish = (error?: Error, value?: Record<string, unknown>): void => {
         clearTimeout(timer)
-        socket.removeEventListener('message', message)
-        socket.removeEventListener('error', failed)
-        socket.removeEventListener('close', closed)
-      }
-      const finish = (error: Error | undefined, value?: Record<string, unknown>): void => {
-        cleanup()
         if (error !== undefined) reject(error)
         else if (value === undefined) reject(new Error(`${endpoint} opening item was absent`))
         else resolve(value)
       }
-      const message = (event: WebSocket.MessageEvent): void => {
+      carrier.onFrame((text) => {
         try {
-          const text = typeof event.data === 'string'
-            ? event.data
-            : Buffer.isBuffer(event.data) ? event.data.toString('utf8') : undefined
-          if (text === undefined) throw new Error(`${endpoint} published a non-text frame`)
           const frame: unknown = JSON.parse(text)
           if (!isRecord(frame) || frame.streamId !== streamId) return
           if (frame.type === 'error') {
@@ -225,16 +193,13 @@ async function openingStreamItem(
         } catch (error) {
           finish(error instanceof Error ? error : new Error(String(error)))
         }
-      }
-      const failed = (): void => { finish(new Error(`${endpoint} carrier failed before its opening item`)) }
-      const closed = (): void => { finish(new Error(`${endpoint} carrier closed before its opening item`)) }
-      socket.addEventListener('message', message)
-      socket.addEventListener('error', failed)
-      socket.addEventListener('close', closed)
-      socket.send(JSON.stringify({ type: 'open', streamId, endpoint, payload: { args } }))
+      })
+      carrier.onError(() => { finish(new Error(`${endpoint} carrier failed before its opening item`)) })
+      carrier.onClose(() => { finish(new Error(`${endpoint} carrier closed before its opening item`)) })
+      carrier.send([JSON.stringify({ type: 'open', streamId, endpoint, payload: { args } })])
     })
   } finally {
-    socket.close()
+    await carrier.close()
   }
 }
 

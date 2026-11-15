@@ -5,7 +5,7 @@
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
-import type { Browser, Page, WebSocketRoute } from 'playwright'
+import type { Browser, Page } from 'playwright'
 import { chromium } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed, onTestFinished, type MockInstance } from 'vitest'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -18,6 +18,7 @@ import {
   compareOrRefreshGolden, fixtureUserPrompts,
   launchWebScaffold, recordFixture, watchConsole, webSnapshotMode, type WebScaffold,
 } from './scaffold.ts'
+import { installMuxProbe, type MuxProbe } from './mux.ts'
 import { openSettings, connectFreshWorkspace, newEnglishPage, pinBrowserClock, pinHostClock, saveFailureShot } from './support.ts'
 
 const SNAPSHOT_DIR = fileURLToPath(new URL('../../../snapshots/web/steering', import.meta.url))
@@ -372,15 +373,14 @@ describe.each(['reconnect', 'delayed-inbox'] as const)('web e2e: composer shortc
   let browser: Browser
   let page: Page
   let tripwire: ReturnType<typeof watchConsole>
-  let remoteSocket: WebSocketRoute | undefined
   const sessionEvents: SessionEvent[] = []
+  let mux: MuxProbe
   let holdInbox = false
   let heldStream: string | undefined
-  let heldControl: (() => void)[] = []
-  const releaseInbox = (): void => {
+  const releaseInbox = async (): Promise<void> => {
     holdInbox = false
-    for (const send of heldControl) send()
-    heldControl = []
+    heldStream = undefined
+    await mux.release()
   }
 
   beforeAll(async () => {
@@ -388,19 +388,16 @@ describe.each(['reconnect', 'delayed-inbox'] as const)('web e2e: composer shortc
     scaffold.ctx.on('session/event', (_session, event) => { sessionEvents.push(event) })
     browser = await chromium.launch()
     page = await newEnglishPage(browser)
-    await page.routeWebSocket('**/api/remote.mux', (route) => {
-      remoteSocket = route
-      const server = route.connectToServer()
-      server.onMessage((message) => {
-        const frame = parseRemoteStreamServerMessage(String(message))
+    mux = await installMuxProbe(page, {
+      gate: (message) => {
+        const frame = parseRemoteStreamServerMessage(message)
         if (holdInbox && frame.type === 'item') {
           const value = frame.value as { type?: string; changes?: readonly { key: string }[] }
           if (value.type === 'projection' && value.changes?.some(change => change.key === 'inbox') === true) heldStream = frame.streamId
         }
         // Hold the remaining control stream in FIFO order, while history keeps flowing.
-        if (holdInbox && frame.streamId === heldStream) heldControl.push(() => { route.send(message) })
-        else route.send(message)
-      })
+        return holdInbox && frame.streamId === heldStream ? 'hold' : 'pass'
+      },
     })
     tripwire = watchConsole(page)
     await page.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
@@ -455,16 +452,16 @@ describe.each(['reconnect', 'delayed-inbox'] as const)('web e2e: composer shortc
       expect(await page.getByText(STEER, { exact: true }).count()).toBe(1)
       expect(await page.locator('[data-submission-echo]').filter({ hasText: STEER }).count()).toBe(1)
       if (handoff === 'reconnect') {
-        const socket = remoteSocket
-        if (socket === undefined) throw new Error('steering page has no Remote connection')
+        const carriers = await mux.connections()
+        if (carriers === 0) throw new Error('steering page has no Remote connection')
         const warningStart = tripwire.warnings.length
-        await socket.close({ code: 1012, reason: 'steering reconnect checkpoint' })
-        await expect.poll(() => remoteSocket !== socket, { timeout: 10_000 }).toBe(true)
+        await mux.kill()
+        await expect.poll(() => mux.connections(), { timeout: 10_000 }).toBeGreaterThan(carriers)
         await expect.poll(() => page.locator('[data-submission-echo]').count(), { timeout: 10_000 }).toBe(0)
         expect(await page.getByText(STEER, { exact: true }).count()).toBe(0)
         acknowledgeReloadConnectionLoss(tripwire, warningStart)
       } else {
-        await expect.poll(() => heldControl.length, { timeout: 10_000 }).toBeGreaterThan(0)
+        await expect.poll(async () => (await mux.held()).length, { timeout: 10_000 }).toBeGreaterThan(0)
         admission.resolve(undefined)
         await page.locator('[data-chat-flow-kind="steering"]').filter({ hasText: STEER }).waitFor({ timeout: 10_000 })
         expect(await page.getByText(STEER, { exact: true }).count()).toBe(1)
@@ -472,7 +469,7 @@ describe.each(['reconnect', 'delayed-inbox'] as const)('web e2e: composer shortc
       }
     } finally {
       admission.resolve(undefined)
-      releaseInbox()
+      await releaseInbox()
       stopHolding()
       await settled
     }

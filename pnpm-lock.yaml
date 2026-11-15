@@ -751,9 +751,6 @@ importers:
       semver:
         specifier: ^7.8.5
         version: 7.8.5
-      ws:
-        specifier: ^8.21.3
-        version: 8.21.3
     devDependencies:
       '@deepseek-ai/dsh-app-boot':
         specifier: workspace:*
@@ -830,9 +827,6 @@ importers:
       '@types/semver':
         specifier: ^7.8.0
         version: 7.8.0
-      '@types/ws':
-        specifier: ^8.18.1
-        version: 8.18.1
       app-builder-lib:
         specifier: 26.17.0
         version: 26.17.0(patch_hash=b70dc2a2a78ffabb80a4f14fafc7c103237f2b0a207e1f296fa1c1387ea29348)(dmg-builder@26.17.0)(electron-builder-squirrel-windows@26.17.0)(supports-color@9.4.0)
@@ -1409,10 +1403,10 @@ importers:
       '@deepseek-ai/schemastery':
         specifier: link:../../../vendor/schemastery
         version: link:../../../vendor/schemastery
+    devDependencies:
       ws:
         specifier: ^8.21.3
         version: 8.21.3
-    devDependencies:
       '@deepseek-ai/cordis':
         specifier: workspace:~
         version: link:../../../vendor/cordis

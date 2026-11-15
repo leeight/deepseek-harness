@@ -3,8 +3,24 @@
 import type { Branded } from '@deepseek-ai/dsh-brand'
 import { isRemoteJsonValue } from '@deepseek-ai/dsh-typert-protocol'
 
-/** Exact WebSocket route carrying every Typert Remote stream. */
+/** Exact HTTP route carrying every Typert Remote stream. */
 export const REMOTE_STREAM_MUX_PATH = '/api/remote.mux'
+
+/**
+ * Media type of the mux downlink. `GET` requires it and the Host answers with
+ * it; the web server never compresses this type, so frames reach the browser
+ * as they are written.
+ */
+export const REMOTE_STREAM_MUX_MEDIA_TYPE = 'text/event-stream'
+
+/** Query parameter naming the mux session an uplink `POST` belongs to. */
+export const REMOTE_STREAM_SESSION_PARAM = 'session'
+
+/** Response header carrying the Host-issued id of the session a downlink opened. */
+export const REMOTE_STREAM_SESSION_HEADER = 'x-dsh-mux-session'
+
+/** Largest uplink body one `POST` may carry, before the logical inbox applies its own bound. */
+export const REMOTE_STREAM_UPLINK_MAX_BYTES = 16 * 1024 * 1024
 
 /** Gateway-internal logical stream carrying application-selected Cordis events. */
 export const REMOTE_EVENT_STREAM_ENDPOINT = '$events'
@@ -258,7 +274,7 @@ export type RemoteStreamServerMessage =
 
 /**
  * Parse and validate one browser-to-Host text message.
- * @param text - complete WebSocket text message.
+ * @param text - one complete frame body.
  * @returns the validated logical-stream request.
  */
 export function parseRemoteStreamClientMessage(text: string): RemoteStreamClientMessage {
@@ -287,7 +303,7 @@ export function parseRemoteStreamClientMessage(text: string): RemoteStreamClient
 
 /**
  * Parse and validate one Host-to-browser text message.
- * @param text - complete WebSocket text message.
+ * @param text - one complete frame body.
  * @returns the validated logical-stream frame.
  */
 export function parseRemoteStreamServerMessage(text: string): RemoteStreamServerMessage {
@@ -314,10 +330,52 @@ export function parseRemoteStreamServerMessage(text: string): RemoteStreamServer
   })
 }
 
+/** Carrier liveness frame the Host writes when a downlink holds no other traffic. */
+export interface RemoteStreamPingFrame {
+  readonly type: 'ping'
+}
+
+/** Carrier liveness frame the browser posts in answer to a ping. */
+export interface RemoteStreamPongFrame {
+  readonly type: 'pong'
+}
+
+/** Frames the physical carrier owns; they never reach a logical stream decoder. */
+export type RemoteStreamTransportFrame = RemoteStreamPingFrame | RemoteStreamPongFrame
+
+/**
+ * Recognize one carrier liveness frame. Any other text, including invalid
+ * JSON, belongs to the logical stream decoders.
+ * @param text - one complete frame body.
+ * @returns the liveness frame, or `undefined` when the text is not one.
+ */
+export function parseRemoteStreamTransportFrame(text: string): RemoteStreamTransportFrame | undefined {
+  let decoded: unknown
+  try {
+    decoded = JSON.parse(text)
+  } catch {
+    // Not JSON is a logical-stream frame the caller decodes (and rejects) itself.
+    return undefined
+  }
+  if (!isRecord(decoded) || !exactKeys(decoded, ['type'])) return undefined
+  if (decoded.type === 'ping' || decoded.type === 'pong') return { type: decoded.type }
+  return undefined
+}
+
+/**
+ * Frame one encoded message as one downlink event. JSON text never contains a
+ * raw newline, so a frame is always a single `data` line.
+ * @param text - encoded frame body.
+ * @returns the complete event text to write.
+ */
+export function encodeRemoteStreamFrame(text: string): string {
+  return `data: ${text}\n\n`
+}
+
 function parseMessage<T>(text: string, validate: (value: Record<string, unknown>) => T): T {
   let decoded: unknown
   try {
-    decoded = JSON.parse(text) as unknown
+    decoded = JSON.parse(text)
   } catch (cause) {
     throw new Error('api gateway: Remote stream message is not JSON', { cause })
   }

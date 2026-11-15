@@ -1460,7 +1460,7 @@ describe('desktop main startup', () => {
     } finally { harness.app.name = originalName }
   })
 
-  it.each(['http:', 'https:'] as const)('passes the %s Host cookie explicitly and attaches socket credentials only to the owned application origin and window', async (protocol) => {
+  it.each(['http:', 'https:'] as const)('passes the %s Host cookie explicitly to the application view and drops legacy Host cookies', async (protocol) => {
     await import('../src/main.ts')
     await harness.preparing.promise
     harness.prepared.resolve()
@@ -1470,25 +1470,6 @@ describe('desktop main startup', () => {
     await Promise.resolve(invoke(DESKTOP_IPC.boot))
     expect(harness.connectWelcome).toHaveBeenCalledWith(`${protocol}//127.0.0.1:3080/`, 'dsh-desktop-session=test-private')
     expect(harness.removeLegacyHostCookies).toHaveBeenCalledWith(harness.hostCookies, `${protocol}//127.0.0.1:3080/`)
-    const handler = harness.socketHeaders.mock.calls[0]![1] as (
-      details: { url: string; webContentsId: number; requestHeaders: Record<string, string> },
-      callback: (result: unknown) => void,
-    ) => void
-    const callback = vi.fn()
-    const socketProtocol = protocol === 'https:' ? 'wss:' : 'ws:'
-    const details = { url: `${socketProtocol}//127.0.0.1:3080/api/remote.mux`, webContentsId: 42, requestHeaders: { Origin: 'dsh-app://app' } }
-    handler(details, callback)
-    expect(callback).toHaveBeenLastCalledWith({ requestHeaders: {
-      origin: `${protocol}//127.0.0.1:3080`, cookie: 'dsh-desktop-session=test-private', 'sec-fetch-site': 'same-origin',
-    } })
-    handler({ ...details, requestHeaders: { Origin: 'https://other.example' } }, callback)
-    expect(callback).toHaveBeenLastCalledWith({ cancel: true })
-    handler({ ...details, webContentsId: 43 }, callback)
-    expect(callback).toHaveBeenLastCalledWith({})
-    handler({ ...details, url: `${socketProtocol}//127.0.0.1:9999/api/remote.mux` }, callback)
-    expect(callback).toHaveBeenLastCalledWith({})
-    handler({ ...details, url: `${socketProtocol === 'wss:' ? 'ws:' : 'wss:'}//127.0.0.1:3080/api/remote.mux` }, callback)
-    expect(callback).toHaveBeenLastCalledWith({})
   })
 
   it('logs a legacy Host cookie cleanup failure without blocking boot', async () => {

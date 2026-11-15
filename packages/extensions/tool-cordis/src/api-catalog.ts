@@ -4554,7 +4554,7 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
     methods: [
       {
         signature: 'readonly wireStream: TypertGatewayWireStream = { open: (endpoint, payload, uplink, peer, signal) => this.openWireStream(endpoint, payload, uplink, peer, signal, new AbortController()), failure: error => rpcError(error), }',
-        description: 'Carrier adapter shared by the WebSocket mux and local Host transports.',
+        description: 'Carrier adapter shared by the HTTP mux and local Host transports.',
         parameters: [],
       },
       {

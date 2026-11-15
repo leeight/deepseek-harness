@@ -545,7 +545,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'ConnectionHandle',
-    declaration: 'export interface ConnectionHandle {\n    readonly interactions: ConnectionInteractions;\n    readonly isLoopback: boolean;\n    readonly generation: ConnectionGenerationState;\n    readonly state: ConnectionStateSource;\n    readonly rpc: ClientConnectionRpc;\n    openWebSocket(path: string): ConnectionWebSocket;\n    reconnect(): void;\n    registerGenerationSource(source: ConnectionGenerationSource): () => void;\n    start(sinks: ConnectionSinks, config?: ConnectionRecoveryConfig): ConnectionLoop;\n}',
+    declaration: 'export interface ConnectionHandle {\n    readonly interactions: ConnectionInteractions;\n    readonly isLoopback: boolean;\n    readonly generation: ConnectionGenerationState;\n    readonly state: ConnectionStateSource;\n    readonly rpc: ClientConnectionRpc;\n    openStreamMux(request: ConnectionMuxRequest): ConnectionMuxCarrier;\n    reconnect(): void;\n    registerGenerationSource(source: ConnectionGenerationSource): () => void;\n    start(sinks: ConnectionSinks, config?: ConnectionRecoveryConfig): ConnectionLoop;\n}',
   },
   {
     name: 'ConnectionHostInfo',
@@ -558,6 +558,22 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'ConnectionLoop',
     declaration: 'export interface ConnectionLoop {\n    stop(): void;\n}',
+  },
+  {
+    name: 'ConnectionMuxCarrier',
+    declaration: 'export interface ConnectionMuxCarrier {\n    readonly readyState: number;\n    send(data: string): void;\n    close(code?: number, reason?: string): void;\n    addEventListener<Event extends keyof ConnectionMuxEventMap>(event: Event, listener: (event: ConnectionMuxEventMap[Event]) => void, options?: {\n        readonly once?: boolean;\n    }): void;\n    removeEventListener<Event extends keyof ConnectionMuxEventMap>(event: Event, listener: (event: ConnectionMuxEventMap[Event]) => void): void;\n}',
+  },
+  {
+    name: 'ConnectionMuxEventMap',
+    declaration: 'export interface ConnectionMuxEventMap {\n    readonly open: object;\n    readonly error: {\n        readonly error: unknown;\n    };\n    readonly close: object;\n    readonly message: {\n        readonly data: string;\n    };\n}',
+  },
+  {
+    name: 'ConnectionMuxRequest',
+    declaration: 'export interface ConnectionMuxRequest {\n    readonly path: string;\n    readonly session: ConnectionMuxSession;\n    readonly fetch?: RpcFetch | undefined;\n    readonly baseUrl?: string | undefined;\n}',
+  },
+  {
+    name: 'ConnectionMuxSession',
+    declaration: 'export interface ConnectionMuxSession {\n    readonly header: string;\n    readonly query: string;\n}',
   },
   {
     name: 'ConnectionRecoveryConfig',
@@ -582,14 +598,6 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'ConnectionStateSource',
     declaration: 'export interface ConnectionStateSource {\n    getSnapshot(): ConnectionState | undefined;\n    subscribe(listener: () => void): () => void;\n}',
-  },
-  {
-    name: 'ConnectionWebSocket',
-    declaration: 'export interface ConnectionWebSocket {\n    readonly readyState: number;\n    send(data: string): void;\n    close(code?: number, reason?: string): void;\n    addEventListener<Event extends keyof ConnectionWebSocketEventMap>(event: Event, listener: (event: ConnectionWebSocketEventMap[Event]) => void, options?: {\n        readonly once?: boolean;\n    }): void;\n    removeEventListener<Event extends keyof ConnectionWebSocketEventMap>(event: Event, listener: (event: ConnectionWebSocketEventMap[Event]) => void): void;\n}',
-  },
-  {
-    name: 'ConnectionWebSocketEventMap',
-    declaration: 'export interface ConnectionWebSocketEventMap {\n    readonly open: object;\n    readonly error: object;\n    readonly close: object;\n    readonly message: {\n        readonly data: unknown;\n    };\n}',
   },
   {
     name: 'DraftInitializationOptions',
@@ -874,6 +882,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'RenderFactorySlot',
     declaration: 'export type RenderFactorySlot = <F extends keyof SlotFactoryMap & string>(name: F, props: FactoryInputPropsOf<F>, options?: {\n    slots?: Partial<{\n        [N in FactoryLocalNameOf<F>]: FactoryLocalComponent<F, N>;\n    }>;\n    fallback?: ReactNode;\n}) => ReactNode;',
+  },
+  {
+    name: 'RpcFetch',
+    declaration: 'export type RpcFetch = (input: string | URL, init: RequestInit) => Promise<Response>;',
   },
   {
     name: 'ScopeOf',

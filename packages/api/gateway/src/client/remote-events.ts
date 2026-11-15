@@ -68,7 +68,7 @@ export class ClientRemoteEvents {
   /**
    * @param ownerCtx - Client Gateway root used for Agent Context resolution.
    * @param connection - Connection carrier used for HTTP result calls.
-   * @param openStream - selected in-process or WebSocket stream opener.
+   * @param openStream - selected in-process or HTTP mux stream opener.
    */
   constructor(
     private readonly ownerCtx: Context,

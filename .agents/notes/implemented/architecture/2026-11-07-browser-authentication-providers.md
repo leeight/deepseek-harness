@@ -40,7 +40,7 @@ WebServer route registrations declare `anonymous`, `required`, or `deny`; omissi
 
 All five `webserver/*` events carry the corresponding WebServer as their Cordis dispatch subject. Ordinary listeners follow `webServer` service isolation; explicit `global: true` listeners opt out. This applies to request admission, upgrade middleware, the existing page-injection event, and entry-URL collection. Service isolation is a composition mechanism, not a sandbox for same-process plugins.
 
-The Token plugin owns root Token exchange and `/connect` issuance. Its upgrade middleware claims its API Peers only at `/api/remote.mux`, preserving one Socket per API Peer, duplicate409, and synchronous credential revocation before asynchronous cleanup. Inspector and other upgrade routes do not claim that lifecycle. WebApp owns readiness, `printUrl` and `openBrowser` (both default true), SSH suppression, and publication: it collects complete entries, prints them in order, and opens only the first eligible one. No entries means no output or opening.
+The Token plugin owns root Token exchange and `/connect` issuance. Its `webserver/request` listener claims its API Peers only at `/api/remote.mux`, preserving one mux session per API Peer, duplicate 409, and synchronous credential revocation before asynchronous cleanup. Inspector and other routes do not claim that lifecycle. WebApp owns readiness, `printUrl` and `openBrowser` (both default true), SSH suppression, and publication: it collects complete entries, prints them in order, and opens only the first eligible one. No entries means no output or opening.
 
 ### Preserved protocols and explicit limits
 

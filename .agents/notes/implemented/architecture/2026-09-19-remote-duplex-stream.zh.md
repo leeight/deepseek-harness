@@ -8,7 +8,7 @@ Status: implemented
 
 ### 现状
 
-`dsh-api-gateway` 在 `/api/remote.mux` 的一条 WebSocket 上复用 Typert Remote 流。Host 方法通过 `@Remote({ mode: 'stream' })` 和 `RemoteStream<Out, In>` 声明两个方向；生成的 Client 方法返回 `RemoteStreamHandle<Out, In>`。既有的 `Iterable` 和 `AsyncIterable` 返回类型声明仅下行的方法。可选的末位 `signal: AbortSignal` 由 Gateway 提供，不进入线路参数。
+`dsh-api-gateway` 在 `/api/remote.mux` 上的一条 mux 会话里复用 Typert Remote 流，其载体是 [HTTP 事件流](2026-11-13-http-stream-mux.zh.md)：一条 `GET` 下行加按会话寻址的 `POST` 上行。Host 方法通过 `@Remote({ mode: 'stream' })` 和 `RemoteStream<Out, In>` 声明两个方向；生成的 Client 方法返回 `RemoteStreamHandle<Out, In>`。既有的 `Iterable` 和 `AsyncIterable` 返回类型声明仅下行的方法。可选的末位 `signal: AbortSignal` 由 Gateway 提供，不进入线路参数。
 
 两个方向共用一个 `streamId`：
 
@@ -137,7 +137,7 @@ export interface RemoteInvocation {
   readonly service: string
   /** The Peer that initiated the call; every carrier names it explicitly. */
   readonly peer: PeerScope
-  /** Carrier cancellation: Client cancel, socket closure, uplink failure. */
+  /** Carrier cancellation: Client cancel, carrier closure, uplink failure. */
   readonly signal: AbortSignal
   readonly uplinkWindow?: RemoteUplinkWindow | undefined
   /**
@@ -199,9 +199,9 @@ export interface PeerScope {
 | 成员 | 语义 |
 | --- | --- |
 | `connection.browserPeer: PeerScope` | 所有通过认证的浏览器连接共享的 Peer；principal 为 owner；随 connection 生灭 |
-| `connection.admit(request): PeerAdmission` | 检查 Host/Origin 与浏览器或 API 签名 Cookie；返回 `{ rejection: 401 \| 403 }` 或凭据对应的存活 Peer；API Peer 在 connect 时发布，并由其生命周期 socket 负责释放 |
+| `connection.admit(request): PeerAdmission` | 检查 Host/Origin 与浏览器或 API 签名 Cookie；返回 `{ rejection: 401 \| 403 }` 或凭据对应的存活 Peer；API Peer 在 connect 时发布，并由其 mux 下行的关闭负责释放 |
 
-网关 `handleUpgrade(req, socket, head, peer)` 为该 socket 绑一个固定 Peer 的 opener，并在 `peer.ctx.effect` 里登记 socket 关闭；scope 已失效时改为直接以 1001 关闭 socket。`InvokeRemoteRequest.peer`、`RemoteStreamOpener` 与 `wireStream.open` 的 `peer` 形参均为 required，每个进程内调用方都显式给出 Peer，网关不自建 Peer。按 id 查 Peer、Peer 的开关事件，都等第一个需要它们的消费者出现时再加。
+网关 `handleDownlink(req, res, peer)` 为该响应绑一个固定 Peer 的 opener，并在 `peer.ctx.effect` 里登记响应关闭；scope 已失效时改为直接销毁响应。`InvokeRemoteRequest.peer`、`RemoteStreamOpener` 与 `wireStream.open` 的 `peer` 形参均为 required，每个进程内调用方都显式给出 Peer，网关不自建 Peer。按 id 查 Peer、Peer 的开关事件，都等第一个需要它们的消费者出现时再加。
 
 Peer 携带自己的 principal；该 principal 能调用什么，由 [Peer 身份属性与 Remote 方法级访问控制](../../implemented/architecture/2026-10-12-peer-principal-and-remote-access.zh.md) 定义的 role、binding 与 policy 判定。
 
@@ -220,7 +220,7 @@ export interface RemoteStreamHandle<Out, In> extends AsyncIterable<Out> {
 ```
 
 - 句柄代表一个代际。载体丢失时 `for await` 以 `RemoteStreamCarrierError` 失败，句柄到此结束；要不要重开、带什么参数重开，是上层协议的事。
-- `send` 是同步的：入队前做 `isRemoteJsonValue` 校验，非无损 JSON 值同步抛错。浏览器 `WebSocket.send` 没有写回调，发送节流没有意义；Host 侧的 inbox 上限是唯一的背压点。
+- `send` 是同步的：入队前做 `isRemoteJsonValue` 校验，非无损 JSON 值同步抛错。载体由单一串行 pump 发送排队帧，`send` 只入队，Host 侧的 inbox 上限是唯一的背压点。
 - 收到终止帧（`end` / `error`）时，mux 客户端在收帧路径上立即停泵并关闭上行队列，之后 `send` / `end` 抛错，不等消费者下一次读。
 - `dispose()` 调用载体迭代器的 `return()`，让 `cancel` 帧在无人读下行时也发出；之后句柄的 `next()` 直接结束，缓冲项丢弃。消费者提前 `break` 出 `for await` 等价于 `dispose()`。
 - `$stream` 监督器、`RemoteSnapshotStream`、`RemoteJournalStream` 是上层工具，不在传输层内。它们的 `open` 工厂拿到的对象现在就是句柄，`for await` 行为不变；把 `send` 透出到这些上层协议是后续的事。
@@ -241,7 +241,7 @@ export type RemoteStreamServerMessage =
   | { readonly type: 'end'; readonly streamId: string }
 ```
 
-解析规则：`item` 精确键 `type` `streamId` 加可选 `value`，`value` 须为无损 JSON 值（`isRemoteJsonValue`）；`end` 精确键 `type` `streamId`。其余形状是帧格式违规，socket 以 1008 关闭。不引入二进制帧。
+解析规则：`item` 精确键 `type` `streamId` 加可选 `value`，`value` 须为无损 JSON 值（`isRemoteJsonValue`）；`end` 精确键 `type` `streamId`。其余帧是帧格式违规，Host 回 400 并终止该 mux 会话。不引入二进制帧。
 
 ### 逻辑流状态机
 
@@ -254,7 +254,7 @@ export type RemoteStreamServerMessage =
                                   │ item frame: inbox.push           │ item frame: inbox.push
                                   │ end frame: inbox.end             │ end frame: inbox.end (uplink half-close)
                                   │                                  │ method yield: sends item frame
-                                  │ cancel frame / socket close ────▶│ cancel frame / socket close: control.abort
+                                  │ cancel frame / carrier close ───▶│ cancel frame / carrier close: control.abort
                                   ▼                                  ▼
                                aborted ◀───────────────────────── finished (sends end or error frame)
 ```
@@ -264,7 +264,7 @@ export type RemoteStreamServerMessage =
 #### Client 侧
 
 ```
-   call generated method ──▶ await socket ──▶ send open ──▶ handle usable
+   call generated method ──▶ await carrier ──▶ send open ──▶ handle usable
                                                             │ send(v): sends item; end(): sends end
                                                             │ downlink: inbox.next() → yield; end → ends; error → throws
                                                             │ downlink terminates first: send/end throw
@@ -279,9 +279,9 @@ export type RemoteStreamServerMessage =
 | 仍开放 | Host 方法结束，发 `end` | 客户端句柄终止，之后 `send` / `end` 抛错；Host 调用 `uplink` 迭代器的 `return()`，未消费项丢弃 |
 | 仍开放 | Host 方法抛错，发 `error` | 同上；客户端下行以 `RemoteError` 失败 |
 | 客户端 `dispose` 或 signal 中止 | 任意 | 发 `cancel`；Host `control.abort()`，`cancellableStream` 先关 `uplink`，再调方法迭代器的 `return()`；不发终止帧 |
-| socket 关闭 | 任意 | Host 中止全部流并等待 `done`；客户端每条流以 `RemoteStreamCarrierError` 失败 |
-| `end` 之后又收到 `item` | 任意 | 该流以 `gateway/protocol` 错误帧失败并中止；socket 不关闭 |
-| 未知 `streamId` 的 `item` / `end` | 任意 | 忽略，与 `cancel` 相同：Host 结束流并删除 id 后，客户端在途的上行帧属正常现象，不能连累同一 socket 上的其他流 |
+| 载体关闭 | 任意 | Host 中止全部流并等待 `done`；客户端每条流以 `RemoteStreamCarrierError` 失败 |
+| `end` 之后又收到 `item` | 任意 | 该流以 `gateway/protocol` 错误帧失败并中止；会话不关闭 |
+| 未知 `streamId` 的 `item` / `end` | 任意 | 忽略，与 `cancel` 相同：Host 结束流并删除 id 后，客户端在途的上行帧属正常现象，不能连累同一会话上的其他流 |
 
 ### 取消等待的生命周期
 
@@ -291,11 +291,11 @@ Host 下行在每次读取后清除当前拒绝回调，并在再次读取前检
 
 ### 顺序保证
 
-同一条 socket 上的帧全序到达：一条逻辑流的 `open`、`item`…、`end` 按发送顺序到达 Host；上行项进入 `uplink()` 的顺序就是 `send` 的顺序。上行与下行之间没有跨方向顺序保证；需要请求应答配对的协议自带序号。
+同一条会话上的帧全序到达：客户端单一上行 pump 一次只发一批，所以一条逻辑流的 `open`、`item`…、`end` 按发送顺序到达 Host；上行项进入 `uplink()` 的顺序就是 `send` 的顺序。上行与下行之间没有跨方向顺序保证；需要请求应答配对的协议自带序号。
 
 ### 背压
 
-WebSocket 没有 HTTP/2 那样的每流窗口，一个连接一条串行写链，慢流会拖住同连接的其他流。下行的这一性质不变。上行：
+两种载体都没有 HTTP/2 那样的每流窗口：一条会话只有一条串行写链，慢流会拖住同一会话上的其他流。下行在事件流上依旧如此，一个响应缓冲区服务于全部流。上行：
 
 **有界 inbox 加整流失败。** Host 每条逻辑流的 inbox 按帧的 UTF-8 字节计量，上限为网关配置 `streamInboxBytes`（默认 262144），对所有流生效。超限时整条逻辑流以 `gateway/uplink-overflow` 失败：下行一起断，向客户端发 `error` 帧，`uplink()` 迭代器以同一错误结束。数据不丢弃；一个方法不读上行而客户端持续发，是用法错误，由失败显式暴露。
 
@@ -305,11 +305,11 @@ credit 帧留待需要持续大流量上行的消费者出现时再加；inbox �
 
 | 项 | 规则 |
 | --- | --- |
-| 鉴权 | 升级时由 WebServer 准入提供 Peer；打开时校验描述符与查找参数。上行项属于一条已鉴权的流，不重复鉴权 |
-| Peer | 升级时接纳为一个 `PeerScope`，该 socket 上所有流的 `invocation.peer` 都是它 |
+| 鉴权 | 下行准入时由 WebServer 提供 Peer；打开时校验描述符与查找参数。上行项属于一条已鉴权的流，不重复鉴权 |
+| Peer | 随下行接纳为一个 `PeerScope`，该会话上所有流的 `invocation.peer` 都是它，上行 POST 必须携带同一个 Peer |
 | 项校验 | 有 uplink codec 时逐项严格解码，失败即整条流以既有的 `gateway/input-invalid` 失败（details `{ endpoint, field: 'uplink' }`）；无 codec 时只做 JSON 安全校验 |
-| 帧大小 | 单帧沿用 `ws` 的 `maxPayload`；inbox 上限限制累计量 |
-| 帧压缩 | Gateway 配置 `websocketCompression` 为 `'deflate'`（默认）时，每条连接协商 `permessage-deflate`；少于 1024 个字符的帧不压缩。见[压缩决定](2026-10-18-websocket-permessage-deflate.zh.md) |
+| 帧大小 | 单次上行 POST 上限 16 MiB（`REMOTE_STREAM_UPLINK_MAX_BYTES`），超过回 413；inbox 上限限制累计量 |
+| 帧压缩 | 两个方向都不压缩：web server 的 gzip 中间件跳过 `text/event-stream`，帧以 JSON 文本传输。见[载体决定](2026-11-13-http-stream-mux.zh.md) |
 
 ### 进程内与 worker 载体
 
@@ -393,8 +393,6 @@ export type RemoteStreamOpener = (
 // index.ts Config addition
 /** Uplink inbox limit per logical stream, in UTF-8 bytes of frames (default 262144). */
 readonly streamInboxBytes?: number
-/** Per-message WebSocket compression; 'none' disables the extension (default 'deflate'). */
-readonly websocketCompression?: 'none' | 'deflate'
 ```
 
 `prepareInvocation`：
@@ -433,13 +431,13 @@ class UplinkInbox implements AsyncIterable<unknown>, AsyncIterator<unknown> {
 `receive(text)` 分派：
 
 ```
-open   : exists → throw (socket 1008); otherwise create { control, inbox, done } and start the pump
+open   : exists → throw (400, session terminated); otherwise create { control, inbox, done } and start the pump
 item   : missing → ignore; otherwise inbox.push(value, bytes)
 end    : missing → ignore; otherwise inbox.end()
 cancel : missing → ignore; otherwise control.abort(new Error('Remote stream cancelled'))
 ```
 
-`pump` 把 inbox 与该 socket 的 Peer 传给 opener；`finally` 里 `inbox.fail(...)`。以 `RemoteError` 为 reason 的中止由 pump 作为 `error` 帧发出（网关或 mux 发起的失败）；以普通 `Error` 为 reason 的中止（cancel、socket 关闭）不发终止帧。
+`pump` 把 inbox 与该会话的 Peer 传给 opener；`finally` 里 `inbox.fail(...)`。以 `RemoteError` 为 reason 的中止由 pump 作为 `error` 帧发出（网关或 mux 发起的失败）；以普通 `Error` 为 reason 的中止（cancel、载体关闭）不发终止帧。
 
 ### 网关 Client（`packages/api/gateway/src/client`）
 
@@ -456,7 +454,7 @@ cancel : missing → ignore; otherwise control.abort(new Error('Remote stream ca
 | `dsh-typert-registry` | 加载校验 `uplink.codec` 为有效的严格 codec |
 | `dsh-typert-generator`（`model.ts`、`analyzer.ts`、`emitter.ts`） | `remoteResultType` 识别 `RemoteStream<Out, In>` 并生成 `uplink` boundary；描述符输出 `uplink: { codec }`；生成的 Client 签名返回 `RemoteStreamHandle<Out, In>`；参数循环只认业务参数与末位 `signal` |
 | `dsh-client-connection`（`peer.ts`、`rpc.ts`、`rpc-host.ts`、`index.ts`） | `Peer` 类；`connection.browserPeer` 与 `admit`；`/api` 与升级路由经 `admit` 取 Peer；`rpc.open` 的可选 `uplink` |
-| `dsh-api-gateway` Host（`stream-protocol.ts`、`stream-server.ts`、`types.ts`、`index.ts`） | `item` / `end` 帧；`UplinkInbox`；`Config.streamInboxBytes` 与 `Config.websocketCompression`；`GatewayInvocation` 与 `extend({ invocation })`；`UplinkDecoder`；`handleUpgrade(req, socket, head, peer)` |
+| `dsh-api-gateway` Host（`stream-protocol.ts`、`stream-server.ts`、`types.ts`、`index.ts`） | `item` / `end` 帧；`UplinkInbox`；`Config.streamInboxBytes` 与 `Config.streamHeartbeatIntervalMs`；`GatewayInvocation` 与 `extend({ invocation })`；`UplinkDecoder`；`handleDownlink(req, res, peer)` 与 `handleUplink(req, res, peer)` |
 | `dsh-api-gateway` Client（`client/index.ts`、`client/stream-client.ts`） | `invokeStream` 返回句柄；上行泵由句柄的队列驱动 |
 | `dsh-webworker-runtime`、`dsh-remote-mock` | worker 隧道的两种上行帧与 `serveStream` 组装；`StreamHandle.uplink`；直接代理返回真句柄 |
 | 文档 | gateway、api 组、connection、protocol、generator 的 README；`docs/api-gateway`；`docs/subsystems/typert` 的 type-equiv 块；config 与 Cordis 目录 |
@@ -513,7 +511,7 @@ Client caller      mux client              mux server                        gat
 | 解码失败 | 不可能 | 流以 `input-invalid` 失败 | 同 | 不可能 |
 | Host 方法结束 | 不可能 | 发 `end`；`uplink.return()` | 发 `end` | 已发 |
 | Host 方法抛错 | 发 `error` | 发 `error`；`uplink.return()` | 发 `error` | 已发 |
-| socket 关闭 | abort，等 done | 同 | 同 | 无事 |
+| 载体关闭 | abort，等 done | 同 | 同 | 无事 |
 | Client `send` | 入队，open 后发 | 发 | 抛错 | 抛错 |
 | Client `end` | 记录，open 后发 | 发 | 幂等 | 忽略 |
 | Client 侧下行先结束 | 不可能 | 停泵；源 `return()`；不发 `end` | 无事 | 无事 |
@@ -531,7 +529,7 @@ Client caller      mux client              mux server                        gat
 
 ## 最小 echo 方法
 
-`packages/api/gateway/tests/echo-stream.host.spec.ts` 让同一个方法分别穿过 WebSocket 载体与进程内载体：
+`packages/api/gateway/tests/echo-stream.host.spec.ts` 让同一个方法分别穿过 HTTP 载体（`MuxSocket`）与进程内载体：
 
 ```text
 class EchoService extends TypertRemoteService {
@@ -590,14 +588,14 @@ for await (const reply of stream) replies.push(reply)   // ['> a', '> b']
 - **所有浏览器连接共享 `browserPeer`**，`admit` 是唯一的网络接纳点；进程内代码经 `connection.createPeer()` 创建其他 Peer。
 - **上行与下行之间没有跨方向顺序保证**；需要请求应答配对的协议自带序号。
 - **上层监督器仅暴露下行**：`$stream`、snapshot 和 journal 不暴露 `send`；需要写入上行的领域保留该代次的生成物理句柄。
-- **worker 隧道与 WebSocket 载体行为不同**：没有 inbox 上限，`end` 之后的项丢弃，因为页面到 worker 是同源可信边界。
+- **worker 隧道与 HTTP 载体行为不同**：没有 inbox 上限，`end` 之后的项丢弃，因为页面到 worker 是同源可信边界。
 
 ## 测试
 
 `gateway-stream.host.spec.ts` 和 `gateway.client.spec.ts` 中的保留对象用例在流保持打开时进行全量 GC，再统计存活的迭代结果。生命周期用例覆盖正常关闭唤醒多个待处理上行读取、两次读取之间的取消、源同步取消后抛错，以及 Client 发送期间流结束。
 
-- `packages/api/gateway/tests/echo-stream.host.spec.ts`：同一个 echo 方法分别穿过 WebSocket 载体与进程内载体。
-- 网关 Host：帧解析的精确键校验；`UplinkInbox` 的 opening 缓冲、`end` 后 `item`、超限、未知 `streamId` 忽略、socket 关闭时的收尾；`UplinkDecoder` 有无 codec 两种交付与解码失败中止；`uplink()` 只能取一次；`extend({ invocation })` 视图与 `peer` 的来源；`cancellableStream` 先关 uplink 再 `return()`。
+- `packages/api/gateway/tests/echo-stream.host.spec.ts`：同一个 echo 方法分别穿过 HTTP 载体与进程内载体。
+- 网关 Host：帧解析的精确键校验；`UplinkInbox` 的 opening 缓冲、`end` 后 `item`、超限、未知 `streamId` 忽略、载体关闭时的收尾；`UplinkDecoder` 有无 codec 两种交付与解码失败中止；`uplink()` 只能取一次；`extend({ invocation })` 视图与 `peer` 的来源；`cancellableStream` 先关 uplink 再 `return()`。
 - 网关 Client：句柄的 `send`（JSON 校验、open 前入队、终止后抛错）、`end` 幂等、`dispose` 驱动 `cancel` 帧并结束后续读取；泵的三种退出；终止帧到达即停泵。
 - typert：analyzer 对 `RemoteStream<Out, In>`、`RemoteStream<Out>`、`never` 与既有 `AsyncIterable<Out>` 的处理；修饰器选项；registry 加载校验。
 - connection：`admit` 的 401、403 与 `browserPeer` 三种结果；`browserPeer` 经桥与共享处理器到达；随 connection 释放。

@@ -437,7 +437,7 @@ type TypertGatewayErrorCode =
 ```ts type-equiv
 /** Host dispatcher consumed by Connection adapters. */
 interface TypertGateway {
-  /** Carrier adapter shared by WebSocket and in-process transports. */
+  /** Carrier adapter shared by HTTP mux and in-process transports. */
   readonly wireStream: TypertGatewayWireStream
   /**
    * Check for an active owner Client event stream, the only kind that can answer forwarded waterfalls.

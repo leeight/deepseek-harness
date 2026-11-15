@@ -60,9 +60,9 @@ API Proxy 不拥有 Session 或 Workspace Remote namespace，也不拥有 Host �
 
 ### Connection generation 与物理连接
 
-浏览器的 Client Remote 插件激活时幂等启动 `RemoteStreamMuxClient`，并立即连接 `/api/remote.mux`。没有业务 logical stream 时物理 WebSocket 仍保持常驻，但 mux 不运行独立的 retry 调度。
+浏览器的 Client Remote 插件激活时幂等启动 `RemoteStreamMuxClient`，并立即连接 `/api/remote.mux`。没有业务 logical stream 时载体仍保持常驻，但 mux 不运行独立的 retry 调度。
 
-Host 按配置的 `websocketHeartbeatIntervalMs` 间隔（默认 2 秒）向每条已打开的 mux socket 发送一个 RFC 6455 Ping 控制帧；浏览器在协议层回复 Pong。两种控制帧都不进入 Remote stream JSON union，也不改变 Connection generation 状态。每次 Ping 前，Host 把 socket 标记为等待 Pong；若到下一间隔仍未收到 Pong，Host 会终止该 socket。
+Host 按配置的 `streamHeartbeatIntervalMs` 间隔（默认 2 秒）向每条已打开的 mux 会话写入一个 `{"type":"ping"}` 传输帧；浏览器回复 `{"type":"pong"}`。两种传输帧都不进入 Remote stream JSON union，也不改变 Connection generation 状态。连续两次 ping 无人应答后，Host 会终止该会话。[HTTP 载体](2026-11-13-http-stream-mux.zh.md)负责这些帧与活动判定规则。
 
 首次建连失败或已连接 socket 丢失后，已打开的 logical stream 会以 `RemoteStreamCarrierError` 结束当前物理 generation。`ConnectionController` 拥有持续且间隔封顶的指数 retry 调度；每次尝试都要求 mux 恰好一次替换候选或活动 socket，再重开 `$events`。用户要求的重连通过同一路径重置 attempt 序列并跳过等待（见[决策](../../archived/feature/2026-08-28-web-connection-recovery-control.md)）。
 

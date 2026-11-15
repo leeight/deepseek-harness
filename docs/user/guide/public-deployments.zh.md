@@ -16,7 +16,7 @@ dsh --profile web --public-url https://app.example/ui/ --trusted-host app.exampl
 
 - **保留浏览器可见的 `Host`。** 栅栏把收到的 `Host` 与被接受的 authority 比对，因此代理应原样转发，而不要改写成监听器的地址。
 - **剥离挂载前缀。** 监听器应答的是 origin-root 路由，因此对 `/ui/api/...` 的请求必须以 `/api/...` 抵达。
-- **转发升级请求。** 页面发出的每个请求与 WebSocket 升级都必须连同其 `Upgrade` 与 `Connection` 头抵达监听器；代理对外提供 HTTPS 时，TLS 在其外部链路上终止。
+- **转发流式响应。** 页面发出的每个请求都必须抵达监听器；代理对外提供 HTTPS 时，TLS 在其外部链路上终止。流 mux 以 `text/event-stream` 应答 `/api/remote.mux`，并发送 nginx 系会遵循的 `x-accel-buffering: no`；会缓冲该响应的代理、CDN 或压缩层会把帧与存活性 ping 一起压住，于是连接看上去仍然正常，流却停滞。
 - **改写 cookie 作用域。** 以明文 HTTP 提供服务的后端签发不带 `Secure` 的 host-only `Path=/` cookie；代理再把 `Path` 改写为挂载（`/ui/`），并仅在其 HTTPS 链路上添加 `Secure`。监听器自身提供 TLS 时 cookie 已带 `Secure`，代理只需改写 `Path`。
 - **重定向裸挂载。** `/ui/` 是唯一入口：只有它把启动 token 换成会话 cookie；已持有该 cookie 的浏览器可由它或 `/ui/index.html` 取得文档，因为所提供的文档以自身目录解析 URL。对 `/ui` 的请求必须以 `/ui/` 抵达，而被剥离路径的后端无法重建该外部路径。
 

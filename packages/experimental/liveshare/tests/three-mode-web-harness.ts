@@ -20,7 +20,6 @@ import {
 import { execa } from 'execa'
 import { expect, onTestFinished } from 'vitest'
 import { resolveExampleLaunch } from '@deepseek-ai/dsh-loader-smoke'
-import { WebSocket } from 'ws'
 
 const dshBinScript = fileURLToPath(new URL('../../../../apps/cli/src/bin.ts', import.meta.url))
 const tsconfigPath = fileURLToPath(new URL('../../../../tsconfig.json', import.meta.url))
@@ -224,20 +223,10 @@ export interface OpenStreamOptions {
 export async function openStream(options: OpenStreamOptions): Promise<StreamObservation> {
   const streamId = `acceptance-${options.endpoint.replace(/\//gu, '-')}-${String(Date.now())}`
     + `-${Math.random().toString(36).slice(2)}`
-  const socket = new WebSocket(`${options.origin.replace(/^http/u, 'ws')}/api/remote.mux`, {
-    headers: { cookie: options.cookie },
-  })
+  const carrier = await openMuxDownlink(options.origin, options.cookie)
   const frames: Wire[] = []
-  const closed = new Promise<void>((resolve) => { socket.once('close', () => { resolve() }) })
-  onTestFinished(async () => {
-    if (socket.readyState === WebSocket.CLOSED) return
-    socket.terminate()
-    await closed
-  })
-  const close = async (): Promise<void> => {
-    if (socket.readyState !== WebSocket.CLOSED) socket.close()
-    await closed
-  }
+  onTestFinished(async () => { await carrier.close() })
+  const close = async (): Promise<void> => { await carrier.close() }
   try {
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -249,25 +238,23 @@ export async function openStream(options: OpenStreamOptions): Promise<StreamObse
         if (error === undefined) resolve()
         else reject(error)
       }
-      socket.once('error', (error: Error) => { settle(error) })
-      socket.on('open', () => {
-        socket.send(JSON.stringify({
-          type: 'open',
-          streamId,
-          endpoint: options.endpoint,
-          payload: { args: options.args },
-        }))
-      })
-      socket.on('message', (data: unknown) => {
+      carrier.onError((error) => { settle(error) })
+      carrier.send([JSON.stringify({
+        type: 'open',
+        streamId,
+        endpoint: options.endpoint,
+        payload: { args: options.args },
+      })])
+      carrier.onFrame((text) => {
         let parsed: RemoteStreamServerMessage
         try {
-          parsed = parseRemoteStreamServerMessage(String(data))
+          parsed = parseRemoteStreamServerMessage(text)
         } catch (error) {
           settle(new Error(`stream ${options.endpoint} sent an invalid frame:`
-            + ` ${String(error)} raw=${redact(String(data)).slice(0, 300)}`))
+            + ` ${String(error)} raw=${redact(text).slice(0, 300)}`))
           return
         }
-        // Every server frame carries its stream id, and this socket opened exactly one stream.
+        // Every server frame carries its stream id, and this carrier opened exactly one stream.
         if (parsed.streamId !== streamId) {
           settle(new Error(`stream ${options.endpoint} received a frame for ${parsed.streamId}`))
           return
@@ -288,8 +275,8 @@ export async function openStream(options: OpenStreamOptions): Promise<StreamObse
         }
         if (options.until?.(frame, frames) === true) settle()
       })
-      socket.once('close', () => {
-        settle(new Error(`stream ${options.endpoint} socket closed before it settled;`
+      carrier.onClose(() => {
+        settle(new Error(`stream ${options.endpoint} carrier closed before it settled;`
           + ` frames=${JSON.stringify(frames).slice(0, 400)}`))
       })
     })
@@ -298,6 +285,100 @@ export async function openStream(options: OpenStreamOptions): Promise<StreamObse
     throw error
   }
   return { frames, close }
+}
+
+/** One mux downlink this driver opened. */
+interface MuxDownlink {
+  /** Posts frames as one uplink body. */
+  send(frames: readonly string[]): void
+  /** Registers a downlink frame listener. */
+  onFrame(listener: (frame: string) => void): void
+  /** Registers a listener for the downlink ending. */
+  onClose(listener: () => void): void
+  /** Registers a listener for a downlink failure. */
+  onError(listener: (error: Error) => void): void
+  /** Closes the downlink. */
+  close(): Promise<void>
+}
+
+/**
+ * Open the mux downlink and answer server pings.
+ * @param origin - Origin the app serves the carrier on.
+ * @param cookie - Launch cookie the app issued.
+ * @returns The carrier, once the app accepted the downlink.
+ */
+async function openMuxDownlink(origin: string, cookie: string): Promise<MuxDownlink> {
+  const url = `${origin}/api/remote.mux`
+  const headers: Record<string, string> = { cookie }
+  const abort = new AbortController()
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: { ...headers, accept: 'text/event-stream' },
+    signal: abort.signal,
+  })
+  const session = response.headers.get('x-dsh-mux-session')
+  const body = response.body
+  if (!response.ok || body === null || session === null) {
+    abort.abort()
+    throw new Error(`mux downlink refused: ${String(response.status)}`)
+  }
+  const uplink = new URL(url)
+  uplink.searchParams.set('session', session)
+  const frameListeners: ((frame: string) => void)[] = []
+  const closeListeners: (() => void)[] = []
+  const errorListeners: ((error: Error) => void)[] = []
+  const drained = (async () => {
+    try {
+      const reader = body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let data: string[] = []
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) return
+        buffer += decoder.decode(value, { stream: true })
+        for (;;) {
+          const newline = buffer.indexOf('\n')
+          if (newline < 0) break
+          const line = buffer.slice(0, newline).replace(/\r$/u, '')
+          buffer = buffer.slice(newline + 1)
+          if (line === '') {
+            if (data.length === 0) continue
+            const frame = data.join('\n')
+            data = []
+            for (const listener of frameListeners) listener(frame)
+          } else if (line.startsWith('data:')) {
+            data.push(line.slice('data:'.length).replace(/^ /u, ''))
+          }
+        }
+      }
+    } catch (error) {
+      if (!abort.signal.aborted) {
+        for (const listener of errorListeners) listener(error instanceof Error ? error : new Error(String(error)))
+      }
+    } finally {
+      for (const listener of closeListeners) listener()
+    }
+  })()
+  return {
+    send: (frames) => {
+      void fetch(uplink, {
+        method: 'POST',
+        headers: { ...headers, 'content-type': 'application/x-ndjson' },
+        body: frames.join('\n'),
+        signal: abort.signal,
+      }).catch((error: unknown) => {
+        for (const listener of errorListeners) listener(error instanceof Error ? error : new Error(String(error)))
+      })
+    },
+    onFrame: (listener) => { frameListeners.push(listener) },
+    onClose: (listener) => { closeListeners.push(listener) },
+    onError: (listener) => { errorListeners.push(listener) },
+    close: async () => {
+      abort.abort()
+      await drained
+    },
+  }
 }
 
 /** Options one acceptance instance boots with. */

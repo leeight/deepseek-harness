@@ -1,12 +1,17 @@
-/** Host WebSocket owner for multiplexed Typert Remote streams. */
+/** Host HTTP owner for multiplexed Typert Remote streams. */
 
-import type { IncomingMessage } from 'node:http'
-import type { Duplex } from 'node:stream'
+import { randomUUID } from 'node:crypto'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Deque } from '@deepseek-ai/dsh-deque'
 import { RemoteError, remoteErrorOf, type PeerScope, type RemoteUplinkWindow } from '@deepseek-ai/dsh-typert-protocol'
-import WebSocket, { WebSocketServer, type RawData } from 'ws'
 import {
+  encodeRemoteStreamFrame,
   parseRemoteStreamClientMessage,
+  parseRemoteStreamTransportFrame,
+  REMOTE_STREAM_MUX_MEDIA_TYPE,
+  REMOTE_STREAM_SESSION_HEADER,
+  REMOTE_STREAM_SESSION_PARAM,
+  REMOTE_STREAM_UPLINK_MAX_BYTES,
   type RemoteStreamClientMessage,
   type RemoteStreamFailure,
   type RemoteStreamServerMessage,
@@ -27,7 +32,7 @@ export type RemoteStreamOpener = (
   window: RemoteUplinkWindow,
 ) => Promise<AsyncIterable<unknown>>
 
-/** The opener one socket uses: its Peer is fixed at upgrade time. */
+/** The opener one session uses: its Peer is fixed when the downlink is admitted. */
 type BoundStreamOpener = (
   endpoint: string,
   payload: unknown,
@@ -43,28 +48,34 @@ const MAX_MISSED_HEARTBEATS = 2
 
 /** Carrier options for {@link RemoteStreamMuxServer}. */
 export interface RemoteStreamMuxServerOptions {
-  /** Interval between WebSocket Ping control frames. */
+  /** Interval between downlink liveness frames. */
   readonly heartbeatIntervalMs: number
   /** Buffered uplink frame bytes one logical stream may hold before it fails. */
   readonly streamInboxBytes: number
-  /** Whether accepted connections negotiate the `permessage-deflate` extension. */
-  readonly compression: boolean
 }
 
-/** Own the no-server WebSocket acceptor and every active logical stream. */
+/** One open downlink and every logical stream it carries. */
+interface MuxSession {
+  readonly response: ServerResponse
+  readonly peer: PeerScope
+  readonly connection: RemoteStreamMuxConnection
+  /** Withdraws the Peer binding that destroys {@link response}. */
+  readonly release: () => Promise<void> | void
+  missedHeartbeats: number
+}
+
+/** Own every open mux downlink and the uplink route that feeds them. */
 export class RemoteStreamMuxServer {
-  private readonly server: WebSocketServer
+  private readonly sessions = new Map<string, MuxSession>()
+  private readonly running = new Set<Promise<void>>()
   private readonly heartbeatIntervalMs: number
   private readonly streamInboxBytes: number
-  private readonly compression: boolean
-  private readonly connections = new Set<Promise<void>>()
-  private readonly missedHeartbeats = new WeakMap<WebSocket, number>()
   private heartbeatTimer: NodeJS.Timeout | undefined
 
   /**
    * @param open - Gateway stream dispatcher.
    * @param failure - Gateway error-to-wire mapper.
-   * @param options - heartbeat interval, uplink inbox bound, and compression setting for accepted connections.
+   * @param options - heartbeat interval and uplink inbox bound.
    */
   constructor(
     private readonly open: RemoteStreamOpener,
@@ -73,83 +84,130 @@ export class RemoteStreamMuxServer {
   ) {
     this.heartbeatIntervalMs = options.heartbeatIntervalMs
     this.streamInboxBytes = options.streamInboxBytes
-    this.compression = options.compression
-    this.server = new WebSocketServer({
-      noServer: true,
-      // `ws` ignores its own `threshold` option while context takeover is
-      // enabled, so the mux decides per frame in send().
-      perMessageDeflate: options.compression ? { zlibDeflateOptions: { level: 1 } } : false,
-    })
   }
 
   /**
-   * Upgrade one admitted request and begin serving its logical streams. Every
-   * stream the socket opens speaks for the Peer admitted at upgrade, and the
-   * socket closes when that Peer's scope is disposed.
-   * @param req - authenticated HTTP upgrade request.
-   * @param socket - carrier socket transferred to the WebSocket server.
-   * @param head - bytes already read after the HTTP upgrade headers.
-   * @param peer - Peer the upgrade was admitted as.
+   * Open one mux session on an admitted `GET`. Every stream the session's
+   * uplinks open speaks for the Peer admitted with the request, and the
+   * downlink ends when that Peer's scope is disposed.
+   * @param req - authenticated downlink request.
+   * @param res - response the session writes one event per frame to.
+   * @param peer - Peer the downlink was admitted as.
    */
-  handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer, peer: PeerScope): void {
-    this.server.handleUpgrade(req, socket, head, (websocket) => {
-      const release = bindPeer(websocket, peer)
-      if (release === undefined) return
-      const alive = (): void => { this.missedHeartbeats.set(websocket, 0) }
-      alive()
-      this.startHeartbeat()
-      const bound: BoundStreamOpener = (endpoint, payload, uplink, control, window) =>
-        this.open(endpoint, payload, uplink, peer, control, window)
-      const connection = new RemoteStreamMuxConnection(
-        websocket, bound, this.failure, this.streamInboxBytes, this.compression, alive,
-      )
-      const done = connection.run().catch((error: unknown) => {
-        console.error('[api-gateway] Remote stream connection failed:', error)
-      }).then(async () => { await release() }).catch((error: unknown) => {
-        console.error('[api-gateway] Remote stream scope cleanup failed:', error)
-      })
-      this.connections.add(done)
-      void done.then(() => { this.connections.delete(done) })
+  handleDownlink(req: IncomingMessage, res: ServerResponse, peer: PeerScope): void {
+    if (!acceptsEvents(req)) {
+      writeText(res, 406, 'events required')
+      return
+    }
+    let release: (() => Promise<void> | void) | undefined
+    try {
+      release = peer.ctx.effect(() => () => { res.destroy() }, 'api-gateway: Remote stream session bound to its Peer')
+    } catch {
+      // A disposed scope leaves no Peer for the session to speak for.
+      res.destroy()
+      return
+    }
+    const bound: BoundStreamOpener = (endpoint, payload, uplink, control, window) =>
+      this.open(endpoint, payload, uplink, peer, control, window)
+    const connection = new RemoteStreamMuxConnection(res, bound, this.failure, this.streamInboxBytes)
+    const id = randomUUID()
+    res.writeHead(200, {
+      'cache-control': 'no-store',
+      'content-type': REMOTE_STREAM_MUX_MEDIA_TYPE,
+      // Reverse proxies must not buffer an event stream behind a full buffer.
+      'x-accel-buffering': 'no',
+      [REMOTE_STREAM_SESSION_HEADER]: id,
     })
+    res.flushHeaders()
+    const session: MuxSession = { response: res, peer, connection, release, missedHeartbeats: 0 }
+    this.sessions.set(id, session)
+    connection.bind(session)
+    this.startHeartbeat()
+    const done = connection.run().catch((error: unknown) => {
+      console.error('[api-gateway] Remote stream downlink failed:', error)
+    }).then(() => {
+      // The response may already be gone; releasing the Peer binding must not
+      // depend on the downlink still being writable.
+      this.sessions.delete(id)
+      connection.unbind()
+      void release()
+      if (!res.writableEnded) res.end()
+    })
+    this.running.add(done)
+    void done.then(() => { this.running.delete(done) })
   }
 
-  /** Terminate all sockets and wait until every iterator has returned. */
+  /**
+   * Accept one uplink frame posted for an open session. The frame is written by
+   * the Client, so a body above {@link REMOTE_STREAM_UPLINK_MAX_BYTES} or one
+   * that fails the stream protocol ends that session's carrier.
+   * @param req - authenticated uplink request.
+   * @param res - response answering the single frame.
+   * @param peer - Peer the request was admitted as.
+   */
+  async handleUplink(req: IncomingMessage, res: ServerResponse, peer: PeerScope): Promise<void> {
+    const id = new URL(req.url ?? '/', 'http://dsh.invalid').searchParams.get(REMOTE_STREAM_SESSION_PARAM)
+    const session = id === null ? undefined : this.sessions.get(id)
+    // A session id is unguessable, and one Peer's frames never reach another's session.
+    if (session === undefined || session.peer !== peer) {
+      writeText(res, 404, 'session not found')
+      return
+    }
+    let text: string
+    try {
+      text = await readUplink(req)
+    } catch (error) {
+      writeText(res, error instanceof UplinkTooLargeError ? 413 : 400, 'invalid uplink frame')
+      return
+    }
+    try {
+      for (const frame of text.split('\n')) {
+        // One request may carry several frames; a pong answers a liveness ping
+        // and never reaches a logical stream.
+        if (frame === '') continue
+        if (parseRemoteStreamTransportFrame(frame) !== undefined) {
+          session.missedHeartbeats = 0
+          continue
+        }
+        session.connection.receive(frame)
+      }
+    } catch {
+      // A frame that fails the stream protocol leaves the session ambiguous, so
+      // it ends the same way a closed socket did.
+      writeText(res, 400, 'invalid uplink frame')
+      session.connection.stop(new Error('Remote stream protocol violation'))
+      return
+    }
+    writeText(res, 204, '')
+  }
+
+  /** End every session and wait until each one released its Peer. */
   async close(): Promise<void> {
     clearInterval(this.heartbeatTimer)
     this.heartbeatTimer = undefined
-    for (const socket of this.server.clients) socket.terminate()
-    const closed = Promise.withResolvers<void>()
-    this.server.close((error) => {
-      if (error === undefined) closed.resolve()
-      else closed.reject(error)
-    })
-    await closed.promise
-    await Promise.all(this.connections)
+    for (const session of [...this.sessions.values()]) session.response.destroy()
+    await Promise.all(this.running)
   }
 
-  /** Start one `unref()` timer after the first upgrade; it spans empty-client periods until close(). */
+  /** Start one `unref()` timer after the first session; it spans idle periods until close(). */
   private startHeartbeat(): void {
     if (this.heartbeatTimer !== undefined) return
     this.heartbeatTimer = setInterval(() => {
-      for (const socket of this.server.clients) {
-        if (socket.readyState !== WebSocket.OPEN) continue
-        const missed = this.missedHeartbeats.get(socket) as number
+      for (const session of [...this.sessions.values()]) {
+        const missed = session.missedHeartbeats
         if (missed >= MAX_MISSED_HEARTBEATS) {
           setImmediate(() => {
-            if ((this.missedHeartbeats.get(socket) as number) >= MAX_MISSED_HEARTBEATS) {
-              socket.terminate()
-            }
+            if (session.missedHeartbeats >= MAX_MISSED_HEARTBEATS) session.response.destroy()
           })
           continue
         }
-        this.missedHeartbeats.set(socket, missed + 1)
-        socket.ping()
+        session.missedHeartbeats = missed + 1
+        void session.connection.ping().catch(() => { session.response.destroy() })
       }
     }, this.heartbeatIntervalMs)
     this.heartbeatTimer.unref()
   }
 }
-
 interface ActiveStream {
   readonly abort: AbortController
   readonly inbox: UplinkInbox
@@ -161,55 +219,59 @@ interface ActiveStream {
 class RemoteStreamMuxConnection {
   private readonly streams = new Map<string, ActiveStream>()
   private writes = Promise.resolve()
+  private session: MuxSession | undefined
 
   constructor(
-    private readonly socket: WebSocket,
+    private readonly response: ServerResponse,
     private readonly open: BoundStreamOpener,
     private readonly failure: RemoteStreamFailureMapper,
     private readonly streamInboxBytes: number,
-    private readonly compression: boolean,
-    private readonly alive: () => void,
   ) {}
 
+  /** Attach the session this connection writes for, so uplink activity can mark it alive. */
+  bind(session: MuxSession): void {
+    this.session = session
+  }
+
+  /** Detach the session once its downlink is gone. */
+  unbind(): void {
+    this.session = undefined
+  }
+
   /**
-   * Serve frames until the socket closes. A Pong, any received frame, and a
-   * downlink write that does not complete at once count as peer activity, so
-   * a congested link that delays the Pong behind data keeps its socket. A
-   * frame above the compression threshold deflates asynchronously, so its
-   * completion always counts; a write that completes at once proves nothing
-   * about the peer and does not count.
+   * Serve frames until the response closes. Since the transport has no control
+   * frames, every uplink post and every downlink write that had to wait for
+   * the response to drain counts as peer activity.
    */
   async run(): Promise<void> {
     const closed = new Promise<void>((resolve) => {
-      this.socket.once('close', resolve)
-      this.socket.once('error', () => { this.socket.terminate() })
-      this.socket.on('pong', this.alive)
-      this.socket.on('message', (data, isBinary) => {
-        this.alive()
-        if (isBinary) {
-          this.socket.close(1003, 'text messages required')
-          return
-        }
-        try {
-          this.receive(rawText(data))
-        } catch {
-          this.socket.close(1008, 'invalid Remote stream request')
-        }
-      })
+      this.response.once('close', resolve)
+      this.response.once('error', () => { this.response.destroy() })
     })
     await closed
     const active = [...this.streams.values()]
-    for (const stream of active) stream.stop(new Error('Remote stream socket closed'))
+    for (const stream of active) stream.stop(new Error('Remote stream downlink closed'))
     await Promise.all(active.map(stream => stream.done))
+  }
+
+  /** Write one liveness frame; a downlink that cannot take it is gone. */
+  async ping(): Promise<void> {
+    await this.write('{"type":"ping"}')
+  }
+
+  /** End the carrier now; the Client sees its downlink close and reconnects. */
+  stop(reason: Error): void {
+    this.response.destroy(reason)
   }
 
   /**
    * Dispatch one frame. `item`, `end`, and `cancel` for a stream this connection
    * no longer owns are dropped: a finished stream leaves the table while the
    * Client's in-flight frames are still arriving. A duplicate `open` is the one
-   * protocol violation that closes the socket.
+   * protocol violation that ends the session.
    */
-  private receive(text: string): void {
+  receive(text: string): void {
+    this.sessionActivity()
     const message = parseRemoteStreamClientMessage(text)
     switch (message.type) {
       case 'open': {
@@ -234,6 +296,10 @@ class RemoteStreamMuxConnection {
         throw new Error(`api gateway: unknown Remote stream client message ${JSON.stringify(unknown)}`)
       }
     }
+  }
+
+  private sessionActivity(): void {
+    if (this.session !== undefined) this.session.missedHeartbeats = 0
   }
 
   private openStream(message: Extract<RemoteStreamClientMessage, { readonly type: 'open' }>): void {
@@ -302,13 +368,13 @@ class RemoteStreamMuxConnection {
   }
 
   private async sendFailure(streamId: string, error: unknown): Promise<void> {
-    if (this.socket.readyState !== WebSocket.OPEN) return
+    if (this.response.destroyed || this.response.writableEnded) return
     try {
       await this.send({ type: 'error', streamId, error: this.failure(error) })
     } catch {
       // A terminal frame that cannot be encoded or written leaves the
       // logical stream ambiguous, so fail the physical generation.
-      this.socket.close(1011, 'Remote stream failure could not be delivered')
+      this.stop(new Error('Remote stream failure could not be delivered'))
     }
   }
 
@@ -319,30 +385,43 @@ class RemoteStreamMuxConnection {
     } catch (cause) {
       return Promise.reject(new Error('api gateway: Remote stream item is not JSON serializable', { cause }))
     }
-    const delivery = this.writes.then(() => new Promise<void>((resolve, reject) => {
-      if (this.socket.readyState !== WebSocket.OPEN) {
-        reject(new Error('api gateway: Remote stream socket is closed'))
-        return
-      }
-      let queued = false
-      this.socket.send(text, {
-        compress: this.compression && text.length >= 1024,
-      }, (error) => {
-        if (error) {
-          reject(error)
-          return
-        }
-        if (queued) this.alive()
-        resolve()
-      })
-      // Read after send(): buffered bytes mean the write did not complete at
-      // once, so its completion counts as peer activity. For a compressed frame
-      // the buffered bytes include ws's deflate queue, not just the TCP send
-      // buffer.
-      queued = this.socket.bufferedAmount > 0
-    }))
+    return this.write(text)
+  }
+
+  private write(text: string): Promise<void> {
+    const frame = encodeRemoteStreamFrame(text)
+    const delivery = this.writes.then(() => this.writeFrame(frame))
     this.writes = delivery.catch(() => undefined)
     return delivery
+  }
+
+  /**
+   * Write one complete event to the response. A write the response accepted
+   * without waiting counts nothing, because it proves only that the local
+   * buffer had room; a write that had to drain proves the Client was reading.
+   */
+  private writeFrame(frame: string): Promise<void> {
+    const response = this.response
+    if (response.destroyed || response.writableEnded) {
+      return Promise.reject(new Error('api gateway: Remote stream downlink is closed'))
+    }
+    if (response.write(frame)) return Promise.resolve()
+    return new Promise<void>((resolve, reject) => {
+      const drain = (): void => {
+        response.off('close', closed)
+        response.off('error', closed)
+        this.sessionActivity()
+        resolve()
+      }
+      const closed = (): void => {
+        response.off('drain', drain)
+        response.off('error', closed)
+        reject(new Error('api gateway: Remote stream downlink is closed'))
+      }
+      response.once('drain', drain)
+      response.once('close', closed)
+      response.once('error', closed)
+    })
   }
 }
 
@@ -435,7 +514,7 @@ class UplinkInbox implements AsyncIterable<unknown>, AsyncIterator<unknown> {
   }
 
   /** Consumer stopped reading: later items are dropped, a pending read ends. */
-  return(): Promise<IteratorResult<unknown>> {
+  return(): Promise<IteratorResult<undefined>> {
     this.closed = true
     this.queue.clear()
     this.bytes = 0
@@ -455,25 +534,38 @@ class UplinkInbox implements AsyncIterable<unknown>, AsyncIterator<unknown> {
   }
 }
 
-/**
- * Close the socket when the Peer's scope is disposed. A scope that is already
- * disposed leaves no Peer for the socket to speak for, so the socket closes now.
- * @returns the registration's disposer, or `undefined` when the socket was closed.
- */
-function bindPeer(websocket: WebSocket, peer: PeerScope): (() => unknown) | undefined {
-  try {
-    return peer.ctx.effect(
-      () => () => { websocket.close(1001, 'peer left') },
-      'api-gateway: Remote stream socket bound to its Peer',
-    )
-  } catch {
-    websocket.close(1001, 'peer left')
-    return undefined
-  }
+class UplinkTooLargeError extends Error {}
+
+/** Whether the Client asked for an event stream, so a plain navigation never opens one. */
+function acceptsEvents(req: IncomingMessage): boolean {
+  const accept = req.headers.accept
+  return typeof accept === 'string'
+    && accept.split(',').some(type => type.split(';', 1)[0]?.trim().toLowerCase() === REMOTE_STREAM_MUX_MEDIA_TYPE)
 }
 
-function rawText(data: RawData): string {
-  if (Array.isArray(data)) return Buffer.concat(data).toString('utf8')
-  if (data instanceof ArrayBuffer) return Buffer.from(data).toString('utf8')
-  return Buffer.from(data).toString('utf8')
+/** Read one complete uplink body, rejecting the session's largest permitted frame. */
+async function readUplink(req: IncomingMessage): Promise<string> {
+  const declared = req.headers['content-length']
+  if (declared !== undefined && Number(declared) > REMOTE_STREAM_UPLINK_MAX_BYTES) throw new UplinkTooLargeError()
+  const chunks: Buffer[] = []
+  let bytes = 0
+  for await (const chunk of req) {
+    const buffer = chunk as Buffer
+    bytes += buffer.byteLength
+    if (bytes > REMOTE_STREAM_UPLINK_MAX_BYTES) throw new UplinkTooLargeError()
+    chunks.push(buffer)
+  }
+  return Buffer.concat(chunks).toString('utf8')
+}
+
+/** Answer one transport-level outcome without keeping the exchange open. */
+function writeText(res: ServerResponse, status: number, body: string): void {
+  if (res.destroyed || res.writableEnded) return
+  const bytes = Buffer.byteLength(body)
+  res.writeHead(status, {
+    'cache-control': 'no-store',
+    'content-type': 'text/plain; charset=utf-8',
+    'content-length': String(bytes),
+  })
+  res.end(body)
 }

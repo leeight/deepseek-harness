@@ -1,4 +1,5 @@
 /** Default token authentication, HTTP exchanges, and entry URL contribution. */
+import type { ServerResponse } from 'node:http'
 import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-credentials'
@@ -6,6 +7,9 @@ import { CONNECT_PATH } from '@deepseek-ai/dsh-client-connection'
 import type { ConnectionTrustRequest, PeerScope } from '@deepseek-ai/dsh-client-connection'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import { BrowserAuth } from './browser-auth.ts'
+
+/** Browser API mux path, matching the API Gateway's stream mux route. */
+const MUX_PATH = '/api/remote.mux'
 
 /** Stable plugin name. */
 export const name = 'host-authentication-token'
@@ -16,6 +20,12 @@ export const inject = ['connection', 'connection.authentication', 'credentials']
 export interface Config {
   /** Absolute cookie lifetime in days; default 30. */
   cookieMaxAgeDays: number
+}
+
+/** One admitted browser API mux session and the release that revokes its Peer. */
+interface MuxSession {
+  readonly response: ServerResponse
+  readonly release: () => Promise<void>
 }
 
 /** Validate cookie lifetime before preparing the token implementation. */
@@ -42,12 +52,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   })
   ctx.inject(['webServer'], (webCtx) => {
     let active = true
-    const sockets = new Map<PeerScope, () => Promise<void>>()
+    const sessions = new Map<PeerScope['id'], MuxSession>()
     webCtx.effect(() => async () => {
       active = false
       apiPeers.clear()
-      await Promise.all([...sockets.values()].map(release => release()))
-    }, 'host-authentication-token: API sockets')
+      for (const session of [...sessions.values()]) session.response.destroy()
+      await Promise.all([...sessions.values()].map(session => session.release()))
+    }, 'host-authentication-token: API mux sessions')
     webCtx.on('webserver/request', async (request, response, next) => {
       const facts: ConnectionTrustRequest = request
       if (facts.socket?.destroyed || response.destroyed || facts.signal?.aborted) return
@@ -77,71 +88,49 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         })
       },
     }), 'host-authentication-token: API connect')
-    webCtx.on('webserver/upgrade', async (request, socket, _head, admittedPeer, next) => {
-      if (admittedPeer === undefined) { await next(); return }
-      if (new URL(request.url ?? '/', 'http://dsh.invalid').pathname !== '/api/remote.mux') {
-        await next()
+    // Mirrors the API Gateway's REMOTE_STREAM_MUX_PATH: this plugin owns the
+    // one-session-per-Peer policy for browser API credentials on that path.
+    webCtx.on('webserver/request', async (request, response, next) => {
+      const facts: ConnectionTrustRequest = request
+      if (facts.socket?.destroyed || response.destroyed || facts.signal?.aborted) return
+      if (!active) { await next(); return }
+      const url = new URL(request.url ?? '/', 'http://dsh.invalid')
+      if (url.pathname !== MUX_PATH || request.method !== 'GET') { await next(); return }
+      const secure = webCtx.webServer.protocol === 'https:'
+      const credential = auth.authenticateApi(request, secure)
+      // Owner cookies and anonymous requests rely on the Gateway's own admission.
+      if (credential === undefined) { await next(); return }
+      const apiPeer = apiPeers.get(credential)
+      if (apiPeer === undefined) {
+        // The credential outlived its Peer, so the Client must reconnect.
+        response.writeHead(401, { 'cache-control': 'no-store' })
+        response.end('unauthorized')
         return
       }
-      if (apiPeers.get(admittedPeer.id) !== admittedPeer) {
-        if (auth.authenticateApi(request, webCtx.webServer.protocol === 'https:') === admittedPeer.id) {
-          socket.destroy()
-          return
-        }
-        await next()
+      if (sessions.has(credential)) {
+        response.writeHead(409, { 'cache-control': 'no-store', connection: 'close' })
+        response.end('conflict')
         return
       }
-      if (!active || admittedPeer.signal.aborted) { socket.destroy(); return }
-      if (sockets.has(admittedPeer)) {
-        socket.end([
-          'HTTP/1.1 409 Conflict',
-          'Connection: close',
-          'Content-Type: text/plain; charset=utf-8',
-          'Content-Length: 8',
-          '',
-          'conflict',
-        ].join('\r\n'))
-        return
-      }
-      const closed = Promise.withResolvers<undefined>()
       let released: Promise<void> | undefined
       const release = (): Promise<void> => {
         if (released !== undefined) return released
-        // Revocation precedes asynchronous Peer and stream cleanup.
-        apiPeers.delete(admittedPeer.id)
-        socket.destroy()
-        released = Promise.all([
-          closed.promise,
-          admittedPeer.dispose().catch((error: unknown) => {
-            console.error('[host-authentication-token] Peer release failed:', error)
-          }),
-        ]).then(() => {
-          sockets.delete(admittedPeer)
-          void disposeSocket()
+        sessions.delete(credential)
+        // A request the Gateway refused never owned this Peer; an unwritten status
+        // still reads 200, so admission requires the admitted downlink's own headers.
+        if (!response.headersSent || response.statusCode !== 200) {
+          released = Promise.resolve()
+          return released
+        }
+        // Revocation precedes asynchronous Peer and session cleanup.
+        apiPeers.delete(credential)
+        released = apiPeer.dispose().catch((error: unknown) => {
+          console.error('[host-authentication-token] Peer release failed:', error)
         })
         return released
       }
-      const failed = (): void => { void release() }
-      const finish = (): void => {
-        socket.removeListener('error', failed)
-        socket.removeListener('close', finish)
-        closed.resolve(undefined)
-        void release()
-      }
-      sockets.set(admittedPeer, release)
-      const disposeSocket = webCtx.effect(() => release, 'host-authentication-token: owned API socket')
-      admittedPeer.ctx.effect(() => {
-        socket.on('error', failed)
-        socket.once('close', finish)
-        return async () => {
-          apiPeers.delete(admittedPeer.id)
-          socket.destroy()
-          // Await only the transport: release itself awaits this Peer disposer.
-          await closed.promise
-        }
-      }, 'host-authentication-token: API socket')
-      if (socket.closed) finish()
-      if (socket.destroyed) { await release(); return }
+      sessions.set(credential, { response, release })
+      response.once('close', () => { void release() })
       try {
         await next()
       } catch (error) {

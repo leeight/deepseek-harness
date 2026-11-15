@@ -60,9 +60,9 @@ API Proxy owns neither the Session or Workspace Remote namespace nor the Host do
 
 ### Connection generation and physical connections
 
-The browser's Client Remote plugin starts `RemoteStreamMuxClient` idempotently on activation and connects to `/api/remote.mux` immediately. The physical WebSocket remains resident even when there is no business logical stream, but the mux performs no independent retry scheduling.
+The browser's Client Remote plugin starts `RemoteStreamMuxClient` idempotently on activation and connects to `/api/remote.mux` immediately. The physical carrier remains resident even when there is no business logical stream, but the mux performs no independent retry scheduling.
 
-The Host sends one RFC 6455 Ping control frame to every open mux socket at the configured `websocketHeartbeatIntervalMs` interval (two seconds by default). The browser replies with Pong at the protocol layer; neither control frame enters the Remote stream JSON union or changes Connection generation state. Before each Ping, the Host marks the socket as awaiting Pong and terminates it at the next interval if no Pong arrived.
+The Host writes one `{"type":"ping"}` transport frame to every open mux session at the configured `streamHeartbeatIntervalMs` interval (two seconds by default). The browser answers `{"type":"pong"}`; neither transport frame enters the Remote stream JSON union or changes Connection generation state. The Host terminates a session once two consecutive pings go unanswered. [The HTTP carrier](2026-11-13-http-stream-mux.md) owns these frames and the activity rule.
 
 After an initial connection failure or the loss of a connected socket, open logical streams end their current physical generation with `RemoteStreamCarrierError`. `ConnectionController` owns the continuous exponential retry schedule with a capped delay; each attempt asks the mux to replace any candidate or active socket exactly once before reopening `$events`. A user-requested reconnect resets the attempt sequence and bypasses the delay through the same path ([decision](../../archived/feature/2026-08-28-web-connection-recovery-control.md)).
 

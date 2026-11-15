@@ -1,6 +1,5 @@
 import { once } from 'node:events'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import WebSocket, { type RawData } from 'ws'
 import { Context } from '@deepseek-ai/cordis'
 import { apply as applyConnection, inject as connectionInject } from '@deepseek-ai/dsh-client-connection'
 import WebServer from '@deepseek-ai/dsh-host-webserver'
@@ -9,6 +8,7 @@ import TypertRegistry from '@deepseek-ai/dsh-typert-registry'
 import TypertGatewayService from '@deepseek-ai/dsh-api-gateway'
 import RemoteAccessService from '@deepseek-ai/dsh-api-remote-access'
 import { browserCookie, provideBrowserCredentials } from './browser-credentials.ts'
+import { MuxSocket } from './mux-socket.ts'
 import { ownerPeer } from './peer.ts'
 
 /** The smallest Remote stream that reads its uplink: every carrier has to serve it alike. */
@@ -44,14 +44,14 @@ describe('the echo stream on each carrier', () => {
     await expect(collect(replies)).resolves.toEqual(['> a', '> b'])
   })
 
-  it('echoes uplink frames through the WebSocket carrier', async () => {
+  it('echoes uplink frames through the HTTP carrier', async () => {
     const ctx = await setup(true)
-    const socket = new WebSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`, {
+    const socket = new MuxSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`, {
       headers: { cookie: await browserCookie(ctx) },
     })
     await once(socket, 'open')
     const frames: unknown[] = []
-    socket.on('message', (data) => { frames.push(JSON.parse(rawText(data))) })
+    socket.on('message', (data: string) => { frames.push(JSON.parse(data)) })
     socket.send(JSON.stringify({ type: 'open', streamId: 'echo', endpoint: 'echo/echo', payload: { args: { prefix: '> ' } } }))
     socket.send(JSON.stringify({ type: 'item', streamId: 'echo', value: 'a' }))
     socket.send(JSON.stringify({ type: 'item', streamId: 'echo', value: 'b' }))
@@ -91,10 +91,4 @@ async function collect(source: AsyncIterable<unknown>): Promise<unknown[]> {
   const values: unknown[] = []
   for await (const value of source) values.push(value)
   return values
-}
-
-function rawText(data: RawData): string {
-  if (Array.isArray(data)) return Buffer.concat(data).toString('utf8')
-  if (data instanceof ArrayBuffer) return Buffer.from(data).toString('utf8')
-  return Buffer.from(data).toString('utf8')
 }

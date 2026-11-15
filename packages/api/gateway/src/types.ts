@@ -152,7 +152,7 @@ export interface PendingRemoteEventInfo {
 
 /** Host dispatcher consumed by Connection adapters. */
 export interface TypertGateway {
-  /** Carrier adapter shared by WebSocket and in-process transports. */
+  /** Carrier adapter shared by HTTP mux and in-process transports. */
   readonly wireStream: TypertGatewayWireStream
 
   /**

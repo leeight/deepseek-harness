@@ -16,7 +16,7 @@ dsh --profile web --public-url https://app.example/ui/ --trusted-host app.exampl
 
 - **Preserve the browser-facing `Host`.** The fence compares the received `Host` against the accepted authorities, so the proxy forwards it unchanged instead of rewriting it to the listener's address.
 - **Strip the mount prefix.** The listener answers origin-root routes, so a request for `/ui/api/...` must arrive as `/api/...`.
-- **Forward upgrades.** Every request and WebSocket upgrade the page opens must reach the listener with its `Upgrade` and `Connection` headers intact; TLS terminates on the proxy's external leg when it serves HTTPS.
+- **Forward streaming responses.** Every request the page opens must reach the listener, and TLS terminates on the proxy's external leg when it serves HTTPS. The stream mux answers `/api/remote.mux` with `text/event-stream` and sends `x-accel-buffering: no`, which the nginx family honors; a proxy, CDN, or compression layer that buffers the response holds frames and liveness pings together, so streams stall while the connection still reads as open.
 - **Rewrite cookie scope.** A backend serving plain HTTP issues host-only `Path=/` cookies without `Secure`; the proxy then rewrites `Path` to the mount (`/ui/`) and adds `Secure` on its HTTPS leg. A backend listener serving its own TLS already marks the cookie `Secure`, so the proxy only rewrites `Path`.
 - **Redirect the bare mount.** `/ui/` is the only entry: it alone exchanges the launch token for the session cookie, and it or `/ui/index.html` serves the document to a browser that already holds that cookie, because the served document resolves URLs against its own directory. A request to `/ui` must arrive as `/ui/`, and the stripped backend cannot reconstruct that external path.
 

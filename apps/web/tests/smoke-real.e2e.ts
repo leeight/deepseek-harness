@@ -26,7 +26,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import type { Browser, Page } from 'playwright'
 import { chromium } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
-import WebSocket from 'ws'
+import { openMuxCarrier } from './mux.ts'
 import { REPO_ROOT, connectFreshWorkspace, newEnglishPage, probeFreePort, requireDist, saveFailureShot } from './support.ts'
 
 const WEB_SURFACE_PROMPT = fileURLToPath(new URL('./expected/web-runtime-context/web-surface-prompt.expected.md', import.meta.url))
@@ -113,52 +113,20 @@ async function remoteRpc<T>(baseUrl: string, endpoint: string, args: object): Pr
 /** Read the explicit page cut from a freshly opened Session follow stream. */
 async function sessionCursor(baseUrl: string, sessionId: string): Promise<number> {
   const authenticated = await authenticatedWeb(baseUrl)
-  const socket = new WebSocket(`${authenticated.origin.replace(/^http/u, 'ws')}/api/remote.mux`, {
-    headers: { cookie: authenticated.cookie },
+  const carrier = await openMuxCarrier(`${authenticated.origin}/api/remote.mux`, {
+    cookie: authenticated.cookie,
   })
   const streamId = `smoke-history-${randomUUID()}`
   try {
-    await new Promise<void>((resolve, reject) => {
-      const cleanup = (): void => {
-        socket.removeEventListener('open', opened)
-        socket.removeEventListener('error', failed)
-        socket.removeEventListener('close', closed)
-      }
-      const opened = (): void => {
-        cleanup()
-        resolve()
-      }
-      const failed = (): void => {
-        cleanup()
-        reject(new Error('session/follow carrier failed before opening'))
-      }
-      const closed = (): void => {
-        cleanup()
-        reject(new Error('session/follow carrier closed before opening'))
-      }
-      socket.addEventListener('open', opened)
-      socket.addEventListener('error', failed)
-      socket.addEventListener('close', closed)
-    })
     return await new Promise<number>((resolve, reject) => {
       const timer = setTimeout(() => { finish(new Error('session/follow did not publish an opening cursor')) }, 10_000)
-      const cleanup = (): void => {
+      const finish = (error?: Error, cursor?: number): void => {
         clearTimeout(timer)
-        socket.removeEventListener('message', message)
-        socket.removeEventListener('error', failed)
-        socket.removeEventListener('close', closed)
-      }
-      const finish = (error: Error | undefined, cursor?: number): void => {
-        cleanup()
         if (error !== undefined) reject(error)
         else resolve(cursor ?? -1)
       }
-      const message = (event: WebSocket.MessageEvent): void => {
+      carrier.onFrame((text) => {
         try {
-          const text = typeof event.data === 'string'
-            ? event.data
-            : Buffer.isBuffer(event.data) ? event.data.toString('utf8') : undefined
-          if (text === undefined) throw new Error('session/follow published a non-text frame')
           const frame: unknown = JSON.parse(text)
           if (!isRecord(frame) || frame.streamId !== streamId) return
           if (frame.type === 'error') {
@@ -177,21 +145,18 @@ async function sessionCursor(baseUrl: string, sessionId: string): Promise<number
         } catch (error) {
           finish(error instanceof Error ? error : new Error(String(error)))
         }
-      }
-      const failed = (): void => { finish(new Error('session/follow carrier failed before its opening cursor')) }
-      const closed = (): void => { finish(new Error('session/follow carrier closed before its opening cursor')) }
-      socket.addEventListener('message', message)
-      socket.addEventListener('error', failed)
-      socket.addEventListener('close', closed)
-      socket.send(JSON.stringify({
+      })
+      carrier.onError(() => { finish(new Error('session/follow carrier failed before its opening cursor')) })
+      carrier.onClose(() => { finish(new Error('session/follow carrier closed before its opening cursor')) })
+      carrier.send([JSON.stringify({
         type: 'open',
         streamId,
         endpoint: 'session/follow',
         payload: { args: { request: { address: { kind: 'session', sessionId } } } },
-      }))
+      })])
     })
   } finally {
-    socket.close()
+    await carrier.close()
   }
 }
 

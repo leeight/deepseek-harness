@@ -23,6 +23,7 @@ import {
   acknowledgeReloadConnectionLoss, assertFixtureInventory, captureStableAria, compareOrRefreshGolden,
   launchWebScaffold, readPersistedEvents, seedSession, watchConsole, webSnapshotMode, type WebScaffold,
 } from './scaffold.ts'
+import { installMuxProbe, type MuxProbe } from './mux.ts'
 import { newEnglishPage, saveFailureShot } from './support.ts'
 import { brandString } from '@deepseek-ai/dsh-brand'
 
@@ -43,8 +44,9 @@ describe('web e2e: workspace management (create / rename / grouping / hover affo
   let browser: Browser
   let page: Page
   let tripwire: ReturnType<typeof watchConsole>
+  let mux: MuxProbe
   let holdAttachment = false
-  let releaseAttachment: (() => void) | undefined
+  let releaseAttachment: (() => Promise<void>) | undefined
 
   /**
    * Raise the region header's directory dialog and drive it to a directory via
@@ -141,21 +143,20 @@ describe('web e2e: workspace management (create / rename / grouping / hover affo
     await seedSession(scaffold, await readFile(SEED, 'utf8'), SEED_ID)
     browser = await chromium.launch()
     page = await newEnglishPage(browser)
-    await page.routeWebSocket('**/api/remote.mux', (route) => {
-      const server = route.connectToServer()
-      server.onMessage((message) => {
-        const frame = JSON.parse(String(message)) as {
+    mux = await installMuxProbe(page, {
+      gate: (frame) => {
+        const parsed = JSON.parse(frame) as {
           type: string
           value?: { type: string; workspace?: { sessionIds: string[] } }
         }
-        if (holdAttachment && frame.type === 'item' && frame.value?.type === 'upsert'
-          && frame.value.workspace?.sessionIds.includes(SEED_ID) === true) {
+        if (holdAttachment && parsed.type === 'item' && parsed.value?.type === 'upsert'
+          && parsed.value.workspace?.sessionIds.includes(SEED_ID) === true) {
           holdAttachment = false
-          releaseAttachment = () => { route.send(message) }
-          return
+          releaseAttachment = async () => { await mux.release() }
+          return 'hold'
         }
-        route.send(message)
-      })
+        return 'pass'
+      },
     })
     tripwire = watchConsole(page)
     await page.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
@@ -276,7 +277,7 @@ describe('web e2e: workspace management (create / rename / grouping / hover affo
     expect(await seededRow.count()).toBe(0)
     const deliverAttachment = releaseAttachment!
     releaseAttachment = undefined
-    deliverAttachment()
+    await deliverAttachment()
     await seededRow.click({ timeout: 10_000 })
     await expect.poll(() => seededRow.getAttribute('aria-selected'), { timeout: 10_000 }).toBe('true')
 

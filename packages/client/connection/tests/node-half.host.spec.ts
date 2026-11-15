@@ -1,7 +1,7 @@
 /** Node half: registers the /api prefix route bridging to the api gateway. */
-import { EventEmitter, once } from 'node:events'
+import { EventEmitter } from 'node:events'
 import { createServer, request as httpRequest } from 'node:http'
-import { PassThrough, Readable } from 'node:stream'
+import { Readable } from 'node:stream'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it, vi } from 'vitest'
@@ -886,67 +886,6 @@ describe('operator-scoped connect', () => {
     } finally { await host.dispose() }
   })
 
-  it('dispatches HTTP before a socket and lets an admitted call finish after socket release', async () => {
-    const host = await mounted()
-    const finish = Promise.withResolvers<undefined>()
-    const started = Promise.withResolvers<AbortSignal>()
-    try {
-      const first = await connect(host)
-      const second = await connect(host)
-      const peer = admitted(host.connection, first.cookie)
-      expect(admitted(host.connection, second.cookie).id).not.toBe(peer.id)
-      host.connection.rpc.intercept('/api', () => true, async (_endpoint, _payload, signal, caller) => {
-        expect(caller).toBe(peer)
-        if (_endpoint === 'fixture/held') {
-          started.resolve(signal)
-          await finish.promise
-        }
-        return { ok: true, value: { id: caller.id } }
-      })
-      const api = host.routes.find(route => route.path === '/api')!
-      const post = (method: string): IncomingMessage => fakePost({ host: 'localhost', cookie: first.cookie }, `/api/${method}`, {
-        type: 'client-request', rpcId: 'connect-test', method, payload: {},
-      })
-      const beforeSocket = fakeResponse()
-      await api.handler(post('fixture/now'), beforeSocket.response)
-      expect(JSON.parse(String(beforeSocket.state.body))).toMatchObject({ result: { ok: true, value: { id: peer.id } } })
-
-      const pendingResponse = fakeResponse()
-      const pending = api.handler(post('fixture/held'), pendingResponse.response)
-      const signal = await started.promise
-      const socket = new PassThrough()
-      const closed = once(socket, 'close')
-      const accepted = vi.fn(async () => {})
-      await host.ctx.waterfall('webserver/upgrade', fakeRequest({ host: 'localhost', cookie: first.cookie }, '/api/remote.mux'),
-        socket, Buffer.alloc(0), peer, accepted)
-      expect(accepted).toHaveBeenCalledOnce()
-      const duplicate = new PassThrough()
-      const refused = vi.fn(async () => {})
-      await host.ctx.waterfall('webserver/upgrade', fakeRequest({ host: 'localhost', cookie: first.cookie }, '/api/remote.mux'),
-        duplicate, Buffer.alloc(0), peer, refused)
-      expect(refused).not.toHaveBeenCalled()
-      expect(Buffer.concat(await duplicate.toArray()).toString()).toContain('409 Conflict')
-      duplicate.destroy()
-      expect(admitted(host.connection, first.cookie)).toBe(peer)
-      const cleanup = vi.fn()
-      peer.ctx.effect(() => cleanup)
-      socket.emit('error', new Error('connection closed'))
-      expect(host.connection.admit(fakeRequest({ host: 'localhost', cookie: first.cookie }))).toEqual({ rejection: 401 })
-      await closed.catch(() => undefined)
-      await peer.dispose()
-      expect(cleanup).toHaveBeenCalledOnce()
-      expect(signal.aborted).toBe(false)
-      finish.resolve(undefined)
-      await pending
-      expect(pendingResponse.state.status).toBe(200)
-      const afterSocket = fakeResponse()
-      await api.handler(post('fixture/now'), afterSocket.response)
-      expect(afterSocket.state.status).toBe(401)
-      expect(host.connection.admit(fakeRequest({ host: 'localhost', cookie: first.cookie })))
-        .toEqual({ rejection: 401 })
-    } finally { finish.resolve(undefined); await host.dispose() }
-  })
-
   it('retains unused operators for arbitrary elapsed time but rejects expired cookies', async () => {
     const host = await mounted({ cookieMaxAgeDays: 36_500 })
     vi.useFakeTimers()
@@ -971,15 +910,7 @@ describe('operator-scoped connect', () => {
     const api = await connect(host)
     const browserPeer = admitted(host.connection, browser.cookie)
     try {
-      const request = fakeRequest({ host: 'localhost', cookie: browser.cookie }, '/api/remote.mux')
-      const one = new PassThrough()
-      const two = new PassThrough()
-      const proceed = vi.fn(async () => {})
-      await host.ctx.waterfall('webserver/upgrade', request, one, Buffer.alloc(0), browserPeer, proceed)
-      await host.ctx.waterfall('webserver/upgrade', request, two, Buffer.alloc(0), browserPeer, proceed)
-      expect(proceed).toHaveBeenCalledTimes(2)
-      one.destroy()
-      two.destroy()
+      const request = fakeRequest({ host: 'localhost', cookie: browser.cookie })
       expect(admitted(host.connection, browser.cookie)).toBe(browserPeer)
       expect(host.ctx.connection.authentication.authenticate({ headers: { host: 'localhost', cookie: browser.cookie } }))
         .toEqual({ peer: browserPeer })

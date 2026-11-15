@@ -2,12 +2,13 @@
 import { readFile } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { chromium, type Browser, type Page, type WebSocketRoute } from 'playwright'
+import { chromium, type Browser, type Page } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
 import {
   acknowledgeReloadConnectionLoss, assertFixtureInventory, captureStableAria, compareOrRefreshGolden,
   launchWebScaffold, seedSession, watchConsole, webSnapshotMode, type WebScaffold,
 } from './scaffold.ts'
+import { installMuxProbe, type MuxProbe } from './mux.ts'
 import { newEnglishPage, saveFailureShot } from './support.ts'
 
 const SNAPSHOT_DIR = fileURLToPath(new URL('../../../snapshots/web/workspace-recency', import.meta.url))
@@ -20,9 +21,14 @@ describe('web e2e: workspace recency', () => {
   let browser: Browser
   let page: Page
   let tripwire: ReturnType<typeof watchConsole>
-  let socket: WebSocketRoute
+  let mux: MuxProbe
+  // The reconfigured view depends on the Workspace baseline, so the release is explicit.
   let holdWorkspace = false
-  let releaseWorkspace: (() => void) | undefined
+  let heldStream: string | undefined
+  const releaseWorkspace = async (): Promise<void> => {
+    heldStream = undefined
+    await mux.release()
+  }
 
   beforeAll(async () => {
     scaffold = await launchWebScaffold({})
@@ -40,28 +46,19 @@ describe('web e2e: workspace recency', () => {
     }
     browser = await chromium.launch()
     page = await newEnglishPage(browser)
-    await page.routeWebSocket('**/api/remote.mux', (route) => {
-      socket = route
-      const server = route.connectToServer()
-      let heldStream: string | undefined
-      const pending: (string | Buffer)[] = []
-      server.onMessage((message) => {
-        const frame = JSON.parse(String(message)) as {
+    mux = await installMuxProbe(page, {
+      gate: (frame) => {
+        const parsed = JSON.parse(frame) as {
           type: string
-          streamId: string
+          streamId?: string
           value?: { type: string; value?: { archivedSessionIds?: string[] } }
         }
-        if (holdWorkspace && frame.type === 'item' && frame.value?.type === 'baseline'
-          && frame.value.value?.archivedSessionIds !== undefined) {
-          heldStream = frame.streamId
-          releaseWorkspace = () => {
-            heldStream = undefined
-            for (const buffered of pending.splice(0)) route.send(buffered)
-          }
+        if (holdWorkspace && parsed.type === 'item' && parsed.value?.type === 'baseline'
+          && parsed.value.value?.archivedSessionIds !== undefined) {
+          heldStream = parsed.streamId
         }
-        if (frame.streamId === heldStream) pending.push(message)
-        else route.send(message)
-      })
+        return parsed.streamId !== undefined && parsed.streamId === heldStream ? 'hold' : 'pass'
+      },
     })
     await page.clock.setFixedTime(now)
     tripwire = watchConsole(page)
@@ -127,8 +124,8 @@ describe('web e2e: workspace recency', () => {
     await pick('Manual')
     const reconnectWarningStart = tripwire.warnings.length
     holdWorkspace = true
-    await socket.close()
-    await expect.poll(() => releaseWorkspace !== undefined).toBe(true)
+    await mux.kill()
+    await expect.poll(async () => (await mux.held()).length).toBeGreaterThan(0)
     const workspaceTitle = basename(scaffold.workspaceCwd)
     // Session titles can fall back to the workspace name while reconnect projections reload.
     await page.locator('[role="treeitem"][aria-expanded]')
@@ -144,7 +141,7 @@ describe('web e2e: workspace recency', () => {
       return sessionOrderByAccount.__flat_session_order__?.[0] === sessionId
     })).toBe(true)
     holdWorkspace = false
-    releaseWorkspace!()
+    await releaseWorkspace()
     await pick('WorkSpace')
     acknowledgeReloadConnectionLoss(tripwire, reconnectWarningStart)
     await expect.poll(titles).toEqual(['New Session', ...TITLES])
@@ -162,16 +159,14 @@ describe('web e2e: workspace recency', () => {
     expect(restoredRowKeys).toHaveLength(4)
     const workspaceRow = page.getByRole('treeitem').filter({ has: page.getByText(workspaceTitle, { exact: true }) })
     // Document load does not restore the Workspace stream or the selected blank Session. Hold the baseline to exercise that gap.
-    const releaseHeldWorkspace = (): void => { releaseWorkspace?.() }
-    releaseWorkspace = undefined
     holdWorkspace = true
     try {
       await page.reload({ waitUntil: 'load' })
-      await expect.poll(() => releaseWorkspace !== undefined, { timeout: 30_000 }).toBe(true)
+      await expect.poll(async () => (await mux.held()).length, { timeout: 30_000 }).toBeGreaterThan(0)
       expect(await workspaceRow.count()).toBe(0)
     } finally {
       holdWorkspace = false
-      releaseHeldWorkspace()
+      await releaseWorkspace()
     }
     await workspaceRow.waitFor({ state: 'visible', timeout: 30_000 })
     for (const rowKey of restoredRowKeys) {

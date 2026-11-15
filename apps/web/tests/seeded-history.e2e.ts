@@ -274,24 +274,28 @@ describe('web e2e: seeded history renders through cold resume', () => {
     if (MODE !== 'record') await pinBrowserClock(page)
     tripwire = watchConsole(page)
     if (MODE !== 'record') {
-      // A one-message tail makes this short recording exercise the real Load earlier path.
+      // A one-message tail makes this short recording exercise the real Load earlier path: the first Session follow
+      // request is narrowed to one message.
       let pagedOpening = false
-      await page.routeWebSocket('**/api/remote.mux', (socket) => {
-        const server = socket.connectToServer()
-        socket.onMessage((message) => {
-          const frame = JSON.parse(String(message)) as {
-            type: string
-            endpoint?: string
-            payload: { args: { request: { maxMessages: number; turnWindow?: { minMessages: number; minTurns: number } } } }
-          }
-          if (!pagedOpening && frame.type === 'open' && frame.endpoint === 'session/follow') {
-            pagedOpening = true
-            openingWindow = { ...frame.payload.args.request }
-            frame.payload.args.request.maxMessages = 1
-            delete frame.payload.args.request.turnWindow
-            server.send(JSON.stringify(frame))
-          } else server.send(message)
+      await page.route(/\/api\/remote\.mux/u, async (route) => {
+        const postData = route.request().postData()
+        if (postData === null) {
+          await route.continue()
+          return
+        }
+        const frames = postData.split('\n').map(text => JSON.parse(text) as {
+          type: string
+          endpoint?: string
+          payload: { args: { request: { maxMessages: number; turnWindow?: { minMessages: number; minTurns: number } } } }
         })
+        for (const frame of frames) {
+          if (pagedOpening || frame.type !== 'open' || frame.endpoint !== 'session/follow') continue
+          pagedOpening = true
+          openingWindow = { ...frame.payload.args.request }
+          frame.payload.args.request.maxMessages = 1
+          delete frame.payload.args.request.turnWindow
+        }
+        await route.continue({ postData: frames.map(frame => JSON.stringify(frame)).join('\n') })
       })
     }
     await page.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })

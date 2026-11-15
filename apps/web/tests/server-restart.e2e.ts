@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url'
 import { chromium } from 'playwright'
 import { expect, it, onTestFailed, onTestFinished } from 'vitest'
 import { REPO_ROOT, newEnglishPage, saveFailureShot, writeComposerDraft } from './support.ts'
+import { countMuxStreams, installMuxProbe, type MuxStreamCounts } from './mux.ts'
 
 class RestartableServer {
   private child: ChildProcess | undefined
@@ -144,28 +145,11 @@ it.each([false, true])('keeps the same revision, Session and page across a serve
   onTestFinished(() => browser.close())
   const page = await newEnglishPage(browser)
   const errors: string[] = []
-  const streamErrors: unknown[] = []
   const graphs: { rev: string; entries: { id: string; rev: string }[] }[] = []
-  let readyFrames = 0
-  let sessionBaselines = 0
   let navigations = 0
   page.on('pageerror', (error) => { errors.push(String(error)) })
-  page.on('websocket', (socket) => {
-    const endpoints = new Map<string, string>()
-    socket.on('framesent', ({ payload }) => {
-      if (typeof payload !== 'string') return
-      const frame = JSON.parse(payload) as { type?: string; streamId: string; endpoint: string }
-      if (frame.type === 'open') endpoints.set(frame.streamId, frame.endpoint)
-    })
-    socket.on('framereceived', ({ payload }) => {
-      if (typeof payload !== 'string') return
-      const message = JSON.parse(payload) as { type?: string; streamId: string; value?: { type?: string }; error?: unknown }
-      if (message.type === 'error') streamErrors.push(message.error)
-      if (message.type === 'item' && message.value?.type === 'ready') readyFrames++
-      if (message.type === 'item' && endpoints.get(message.streamId) === 'session/follow'
-        && message.value?.type === 'snapshot') sessionBaselines++
-    })
-  })
+  const mux = await installMuxProbe(page)
+  const streams = async (): Promise<MuxStreamCounts> => countMuxStreams(await mux.snapshot())
   const network = await page.context().newCDPSession(page)
   await network.send('Network.enable')
   network.on('Network.eventSourceMessageReceived', (event) => {
@@ -174,7 +158,9 @@ it.each([false, true])('keeps the same revision, Session and page across a serve
   })
   onTestFailed(async () => {
     await saveFailureShot(page, 'web-server-restart-' + scenarioId)
-    await writeFile(join(REPO_ROOT, '.artifacts', 'server-restart-' + scenarioId + '.json'), JSON.stringify({ errors, streamErrors, graphs, server: server.logs() }, null, 2))
+    // The page may already be gone; the artifact then reports no mux stream errors.
+    const observed = await streams().catch(() => ({ ready: 0, sessionBaselines: 0, errors: ['mux probe unavailable'] }))
+    await writeFile(join(REPO_ROOT, '.artifacts', 'server-restart-' + scenarioId + '.json'), JSON.stringify({ errors, streamErrors: observed.errors, graphs, server: server.logs() }, null, 2))
   })
   await page.goto(url, { waitUntil: 'load' })
   await page.locator('[data-slot="root"]').waitFor({ state: 'attached', timeout: 20_000 })
@@ -188,11 +174,12 @@ it.each([false, true])('keeps the same revision, Session and page across a serve
   const draft = 'Unsent draft across a server restart'
   await writeComposerDraft(page, composer, draft)
   await expect.poll(() => graphs.length).toBeGreaterThan(0)
-  await expect.poll(() => sessionBaselines).toBeGreaterThan(0)
+  await expect.poll(async () => (await streams()).sessionBaselines).toBeGreaterThan(0)
   const originalRoot = await page.locator('[data-slot="root"]').elementHandle()
   expect(originalRoot).not.toBeNull()
-  const beforeReady = readyFrames
-  const beforeBaseline = sessionBaselines
+  const beforeFrames = await streams()
+  const beforeReady = beforeFrames.ready
+  const beforeBaseline = beforeFrames.sessionBaselines
   const beforeGraphs = graphs.length
   page.on('framenavigated', () => { navigations++ })
 
@@ -205,31 +192,30 @@ it.each([false, true])('keeps the same revision, Session and page across a serve
         server.startupBlocked.promise,
         restarting.then(() => { throw new Error('the restarted Host did not hold controller startup') }),
       ])
-      const opened = await page.evaluate(() => new Promise<boolean>((resolve) => {
-        const endpoint = new URL('api/remote.mux', location.href)
-        endpoint.protocol = 'ws:'
-        const socket = new WebSocket(endpoint)
-        let accepted = false
-        socket.addEventListener('open', () => { accepted = true; socket.close() })
-        socket.addEventListener('close', () => { resolve(accepted) })
-      }))
+      const opened = await page.evaluate(async () => {
+        const response = await fetch('/api/remote.mux', { headers: { accept: 'text/event-stream' } })
+          .catch(() => undefined)
+        if (response === undefined) return false
+        await response.body?.cancel()
+        return response.ok
+      })
       expect(opened).toBe(false)
-      expect(readyFrames).toBe(beforeReady)
+      expect((await streams()).ready).toBe(beforeReady)
     }
   } finally {
     server.resumeStartup()
     restarted = await restarting
   }
   expect(new URL(restarted).origin).toBe(new URL(url).origin)
-  await expect.poll(() => readyFrames, { timeout: 30_000 }).toBeGreaterThan(beforeReady)
-  await expect.poll(() => sessionBaselines, { timeout: 30_000 }).toBeGreaterThan(beforeBaseline)
+  await expect.poll(async () => (await streams()).ready, { timeout: 30_000 }).toBeGreaterThan(beforeReady)
+  await expect.poll(async () => (await streams()).sessionBaselines, { timeout: 30_000 }).toBeGreaterThan(beforeBaseline)
   await expect.poll(() => graphs.length, { timeout: 30_000 }).toBeGreaterThan(beforeGraphs)
   await page.evaluate(() => new Promise<void>((resolve) => {
     requestAnimationFrame(() => { requestAnimationFrame(() => { resolve() }) })
   }))
 
   expect(errors).toEqual([])
-  expect(streamErrors).toEqual([])
+  expect((await streams()).errors).toEqual([])
   for (const graph of graphs.slice(beforeGraphs)) expect(graph).toEqual(graphs[beforeGraphs - 1])
   expect(await originalRoot!.evaluate(element => element.isConnected)).toBe(true)
   expect(await composer.textContent()).toBe(draft)
@@ -238,7 +224,7 @@ it.each([false, true])('keeps the same revision, Session and page across a serve
   await composer.press('Enter')
   await expect.poll(() => response.count(), { timeout: 20_000 }).toBe(2)
   expect(errors).toEqual([])
-  expect(streamErrors).toEqual([])
+  expect((await streams()).errors).toEqual([])
   expect(navigations).toBe(0)
 })
 

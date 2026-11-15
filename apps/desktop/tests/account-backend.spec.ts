@@ -1,6 +1,5 @@
 import { once } from 'node:events'
-import type { IncomingMessage } from 'node:http'
-import { WebSocketServer } from 'ws'
+import { createServer, type ServerResponse } from 'node:http'
 import { expect, it, onTestFinished, vi } from 'vitest'
 import { accountView, desktopAccountBackend } from '../src/account-backend.ts'
 
@@ -51,15 +50,59 @@ it.each([
   ['snapshot', ['snapshot']],
   ['credentials-changed', ['credentials-changed']],
 ] as const)('receives %s state updates separately from live expiry and rejects type %j', async (type, invalidType) => {
-  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 })
+  interface UplinkFrame { readonly type: string; readonly endpoint?: string; readonly streamId: string }
+  const cookies: Array<string | undefined> = []
+  const streams = new Map<string, string>()
+  const connected = Promise.withResolvers<undefined>()
+  const opened = Promise.withResolvers<undefined>()
+  let downlink: ServerResponse | undefined
+  const server = createServer((request, response) => {
+    const url = new URL(request.url ?? '/', 'http://127.0.0.1')
+    cookies.push(request.headers.cookie)
+    if (request.method === 'GET' && url.pathname === '/api/remote.mux') {
+      if (!String(request.headers.accept).split(',').includes('text/event-stream')) {
+        response.writeHead(406).end('events required')
+        return
+      }
+      response.writeHead(200, {
+        'cache-control': 'no-store',
+        'content-type': 'text/event-stream',
+        'x-dsh-mux-session': 'desktop-session',
+      })
+      response.flushHeaders()
+      downlink = response
+      connected.resolve(undefined)
+      return
+    }
+    if (request.method === 'POST' && url.pathname === '/api/remote.mux') {
+      if (url.searchParams.get('session') !== 'desktop-session') {
+        response.writeHead(404).end('session not found')
+        return
+      }
+      const chunks: Buffer[] = []
+      request.on('data', (chunk: Buffer) => { chunks.push(chunk) })
+      request.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8')
+        for (const line of text.split('\n').filter(frame => frame !== '')) {
+          const frame = JSON.parse(line) as UplinkFrame
+          if (frame.type === 'open' && frame.endpoint !== undefined) streams.set(frame.endpoint, frame.streamId)
+        }
+        response.writeHead(204).end()
+        if (streams.size === 3) opened.resolve(undefined)
+      })
+      return
+    }
+    response.writeHead(404).end()
+  })
+  server.listen(0, '127.0.0.1')
   await once(server, 'listening')
   onTestFinished(async () => {
-    for (const client of server.clients) client.terminate()
+    downlink?.destroy()
+    server.closeAllConnections()
     await new Promise<void>((resolve, reject) => { server.close((error) => { if (error) reject(error); else resolve() }) })
   })
   const address = server.address()
   if (typeof address === 'string' || address === null) throw new Error('missing server address')
-  const connected = once(server, 'connection')
   const expired = vi.fn()
   const onAnalyticsEnabledChanged = vi.fn()
   const snapshot = { status: 'signed-out', attempt: null,
@@ -71,33 +114,25 @@ it.each([
     (value) => { expect(value).toEqual(snapshot); received.resolve(undefined) }, failed, expired, onAnalyticsEnabledChanged,
   )
   onTestFinished(stop)
-  const [, upgrade] = await connected as [unknown, IncomingMessage]
-  expect(upgrade.headers.cookie).toBe('dsh-auth-fixture=signed')
-  // Logical streams share the socket; observe their opening frames before sending data.
-  const streams = new Map<string, string>()
-  const opened = Promise.withResolvers<undefined>()
-  const socket = [...server.clients][0]!
-  socket.on('message', (data) => {
-    if (!Buffer.isBuffer(data)) throw new Error('expected a Buffer WebSocket frame')
-    const frame = JSON.parse(data.toString('utf8')) as { endpoint: string; streamId: string }
-    streams.set(frame.endpoint, frame.streamId)
-    if (streams.size === 3) opened.resolve(undefined)
-  })
+  await connected.promise
   await opened.promise
-  socket.send(JSON.stringify({ type: 'item', streamId: streams.get('account/watch'), value: { type, state: snapshot } }))
+  expect(cookies[0]).toBe('dsh-auth-fixture=signed')
+  const send = (frame: object): void => { downlink?.write(`data: ${JSON.stringify(frame)}\n\n`) }
+  // Logical streams share the downlink; their opening frames named them above.
+  send({ type: 'item', streamId: streams.get('account/watch'), value: { type, state: snapshot } })
   await received.promise
-  socket.send(JSON.stringify({ type: 'item', streamId: streams.get('productAnalytics/watchPolicy'), value: true }))
+  send({ type: 'item', streamId: streams.get('productAnalytics/watchPolicy'), value: true })
   await vi.waitFor(() => { expect(onAnalyticsEnabledChanged).toHaveBeenLastCalledWith(true) })
-  socket.send(JSON.stringify({ type: 'item', streamId: streams.get('productAnalytics/watchPolicy'), value: false }))
+  send({ type: 'item', streamId: streams.get('productAnalytics/watchPolicy'), value: false })
   await vi.waitFor(() => { expect(onAnalyticsEnabledChanged).toHaveBeenLastCalledWith(false) })
-  socket.send(JSON.stringify({ type: 'item', streamId: streams.get('productAnalytics/watchPolicy'), value: true }))
+  send({ type: 'item', streamId: streams.get('productAnalytics/watchPolicy'), value: true })
   await vi.waitFor(() => { expect(onAnalyticsEnabledChanged).toHaveBeenLastCalledWith(true) })
-  socket.send(JSON.stringify({ type: 'item', streamId: streams.get('productAnalytics/watchPolicy'), value: 'invalid policy' }))
+  send({ type: 'item', streamId: streams.get('productAnalytics/watchPolicy'), value: 'invalid policy' })
   await vi.waitFor(() => { expect(onAnalyticsEnabledChanged).toHaveBeenLastCalledWith(false) })
   expect(expired).not.toHaveBeenCalled()
-  socket.send(JSON.stringify({ type: 'item', streamId: streams.get('account/watchExpiry'), value: 'session-expired' }))
+  send({ type: 'item', streamId: streams.get('account/watchExpiry'), value: 'session-expired' })
   await vi.waitFor(() => { expect(expired).toHaveBeenCalledOnce() })
-  socket.send(JSON.stringify({ type: 'item', streamId: streams.get('account/watch'), value: { type: invalidType, state: snapshot } }))
+  send({ type: 'item', streamId: streams.get('account/watch'), value: { type: invalidType, state: snapshot } })
   await vi.waitFor(() => { expect(failed).toHaveBeenCalledOnce() })
   stop()
 })

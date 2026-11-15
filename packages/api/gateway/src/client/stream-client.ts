@@ -1,11 +1,13 @@
-/** Client owner for the Gateway multiplexed Remote stream socket. */
+/** Client owner for the Gateway multiplexed Remote stream carrier. */
 import { RemoteError, remoteErrorOf } from '@deepseek-ai/dsh-typert-protocol'
-import type { ConnectionWebSocket } from '@deepseek-ai/dsh-client-connection/client'
+import type { ConnectionMuxCarrier } from '@deepseek-ai/dsh-client-connection/client'
 
 import {
   parseRemoteStreamServerMessage,
+  parseRemoteStreamTransportFrame,
   REMOTE_STREAM_MUX_PATH,
   type RemoteStreamClientMessage,
+  type RemoteStreamPongFrame,
   type RemoteStreamServerMessage,
 } from '../stream-protocol.ts'
 import { Deque } from '@deepseek-ai/dsh-deque'
@@ -51,7 +53,7 @@ export function isRemoteStreamCarrierFailure(error: unknown): error is RemoteStr
 
 interface SocketWaiter {
   readonly revision: number
-  resolve(socket: ConnectionWebSocket): void
+  resolve(carrier: ConnectionMuxCarrier): void
   reject(error: unknown): void
 }
 
@@ -71,12 +73,12 @@ interface LogicalStream {
 const UPLINK_DONE: IteratorReturnResult<undefined> = { value: undefined, done: true }
 
 /**
- * Keep one physical WebSocket and share it among independently cancellable
- * Remote streams. A carrier that supplies an in-process stream opener never
+ * Keep one physical carrier and share it among independently cancellable
+ * Remote streams. A transport that supplies an in-process stream opener never
  * starts one.
  */
 export class RemoteStreamMuxClient {
-  private socket: ConnectionWebSocket | undefined
+  private socket: ConnectionMuxCarrier | undefined
   private cancelCandidate: ((error: Error) => void) | undefined
   private keepAlive: Promise<void> | undefined
   private revision = 0
@@ -88,11 +90,12 @@ export class RemoteStreamMuxClient {
   private failure: RemoteStreamCarrierFailure | undefined
 
   /**
-   * @param openSocket - selected authenticated carrier; omission uses the browser socket.
-   * @param waitForReconnect - answering Clients wait for Connection to replace a lost socket; passive Clients fail later opens immediately.
+   * @param openCarrier - selected authenticated transport for one physical attempt.
+   * @param waitForReconnect - answering Clients wait for Connection to replace a lost carrier;
+   * passive Clients fail later opens immediately.
    */
   constructor(
-    private readonly openSocket: (path: string) => ConnectionWebSocket = () => new WebSocket(remoteStreamUrl()),
+    private readonly openCarrier: (path: string) => ConnectionMuxCarrier,
     private readonly waitForReconnect = false,
   ) {}
 
@@ -146,7 +149,7 @@ export class RemoteStreamMuxClient {
     const streamId = randomUUID()
     const inbox = new StreamInbox()
     const stream: LogicalStream = { inbox, pump: undefined }
-    let carrier: ConnectionWebSocket | undefined
+    let carrier: ConnectionMuxCarrier | undefined
     let opened = false
     let terminal = false
     const abort = (): void => { inbox.fail(signal.reason) }
@@ -192,7 +195,7 @@ export class RemoteStreamMuxClient {
    * generator blocked in `next()` only completes it once it yields.
    */
   private pumpUplink(
-    socket: ConnectionWebSocket,
+    socket: ConnectionMuxCarrier,
     streamId: string,
     uplink: AsyncIterable<unknown>,
     signal: AbortSignal,
@@ -264,12 +267,12 @@ export class RemoteStreamMuxClient {
     await Promise.all(this.socketClosures)
   }
 
-  private async connect(): Promise<ConnectionWebSocket> {
-    const socket = this.openSocket(REMOTE_STREAM_MUX_PATH)
+  private async connect(): Promise<ConnectionMuxCarrier> {
+    const socket = this.openCarrier(REMOTE_STREAM_MUX_PATH)
     const closed = new Promise<void>((resolve) => { socket.addEventListener('close', () => { resolve() }, { once: true }) })
     this.socketClosures.add(closed)
     void closed.then(() => { this.socketClosures.delete(closed) })
-    const connecting = new Promise<ConnectionWebSocket>((resolve, reject) => {
+    const connecting = new Promise<ConnectionMuxCarrier>((resolve, reject) => {
       let settled = false
       const rejectCandidate = (error: Error): void => {
         settled = true
@@ -291,11 +294,11 @@ export class RemoteStreamMuxClient {
       const failed = (): void => {
         if (!settled) {
           rejectCandidate(new RemoteStreamCarrierError(
-            'api gateway: Remote stream WebSocket failed to open',
+            'api gateway: Remote stream carrier failed to open',
           ))
           return
         }
-        const error = new RemoteStreamCarrierError('api gateway: Remote stream WebSocket failed')
+        const error = new RemoteStreamCarrierError('api gateway: Remote stream carrier failed')
         this.lost(socket, error)
         if (socket.readyState < 2) socket.close()
       }
@@ -305,13 +308,13 @@ export class RemoteStreamMuxClient {
         socket.removeEventListener('message', received)
         if (!settled) {
           rejectCandidate(new RemoteStreamCarrierError(
-            'api gateway: Remote stream WebSocket closed before opening',
+            'api gateway: Remote stream carrier closed before opening',
           ))
           return
         }
         this.lost(socket)
       }
-      const received = (event: { readonly data: unknown }): void => { this.receive(socket, event.data) }
+      const received = (event: { readonly data: string }): void => { this.receive(socket, event.data) }
       this.cancelCandidate = rejectCandidate
       socket.addEventListener('open', opened, { once: true })
       socket.addEventListener('error', failed)
@@ -321,7 +324,7 @@ export class RemoteStreamMuxClient {
     return connecting
   }
 
-  private waitForSocket(signal: AbortSignal): Promise<ConnectionWebSocket> {
+  private waitForSocket(signal: AbortSignal): Promise<ConnectionMuxCarrier> {
     signal.throwIfAborted()
     if (this.socket?.readyState === 1) return Promise.resolve(this.socket)
     if (this.disposed) return Promise.reject(new Error('api gateway: Remote stream client disposed'))
@@ -351,10 +354,17 @@ export class RemoteStreamMuxClient {
     })
   }
 
-  private receive(socket: ConnectionWebSocket, data: unknown): void {
+  private receive(socket: ConnectionMuxCarrier, data: string): void {
     if (socket !== this.socket) return
+    const transport = parseRemoteStreamTransportFrame(data)
+    if (transport !== undefined) {
+      // A liveness ping proves the downlink is alive; answering it over the
+      // uplink proves the same for this side.
+      const pong: RemoteStreamPongFrame = { type: 'pong' }
+      if (transport.type === 'ping') socket.send(JSON.stringify(pong))
+      return
+    }
     try {
-      if (typeof data !== 'string') throw new Error('api gateway: Remote stream WebSocket requires text messages')
       const frame = parseRemoteStreamServerMessage(data)
       const stream = this.streams.get(frame.streamId)
       if (stream === undefined) return
@@ -370,9 +380,9 @@ export class RemoteStreamMuxClient {
   }
 
   private lost(
-    socket: ConnectionWebSocket,
+    socket: ConnectionMuxCarrier,
     error: RemoteStreamCarrierError = new RemoteStreamCarrierError(
-      'api gateway: Remote stream WebSocket closed',
+      'api gateway: Remote stream carrier closed',
     ),
   ): void {
     if (this.socket !== socket) return
@@ -394,7 +404,7 @@ export class RemoteStreamMuxClient {
       (error: unknown) => {
         if (!this.running) return
         const failure = isRemoteStreamCarrierFailure(error) ? error
-          : new RemoteStreamCarrierError('api gateway: Remote stream WebSocket failed to open', { cause: error })
+          : new RemoteStreamCarrierError('api gateway: Remote stream carrier failed to open', { cause: error })
         if (this.revision === revision) this.failure = failure
         for (const waiter of [...this.waiters]) {
           if (waiter.revision <= revision) waiter.reject(failure)
@@ -414,7 +424,7 @@ export class RemoteStreamMuxClient {
     }
   }
 
-  private send(socket: ConnectionWebSocket, message: RemoteStreamClientMessage): void {
+  private send(socket: ConnectionMuxCarrier, message: RemoteStreamClientMessage): void {
     socket.send(JSON.stringify(message))
   }
 }
@@ -523,14 +533,4 @@ export class ClientUplinkQueue implements AsyncIterable<unknown>, AsyncIterator<
     this.wake = undefined
     wake?.()
   }
-}
-
-function remoteStreamUrl(): string {
-  // The mux route is registered absolute; a page resolves its document-relative
-  // form against its own document base. A shell-owned Host on another origin
-  // supplies that base through the transport.
-  const globals = globalThis as { __DSH_TRANSPORT__?: { streamBaseUrl?: string } }
-  const url = new URL(REMOTE_STREAM_MUX_PATH.slice(1), globals.__DSH_TRANSPORT__?.streamBaseUrl ?? document.baseURI)
-  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
-  return url.href
 }

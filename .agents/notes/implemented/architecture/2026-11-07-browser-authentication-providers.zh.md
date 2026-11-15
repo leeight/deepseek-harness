@@ -40,7 +40,7 @@ WebServer 路由注册声明 `anonymous`、`required` 或 `deny`，省略时为 
 
 五个 `webserver/*` 事件均以对应 WebServer 为 Cordis 分发 subject。普通监听器遵循 `webServer` 服务隔离；显式 `global: true` 监听器跳过该过滤。请求准入、upgrade 中间件、已有页面注入事件和入口 URL 收集均采用该规则。服务隔离是组合机制，不是同进程插件的安全沙箱。
 
-Token 插件拥有根 Token 交换和 `/connect` 签发。它的 upgrade 中间件仅在 `/api/remote.mux` 上认领自己的 API Peer，保留每个 API Peer 一个 Socket、重复409，以及在异步清理前同步撤销凭据的行为。Inspector 与其他 upgrade 路由不认领该生命周期。WebApp 拥有就绪、`printUrl` 与 `openBrowser`（两者默认 true）、SSH 抑制和发布：收集完整入口，按序打印，只打开首个可自动打开的入口。没有入口则不输出、不打开。
+Token 插件拥有根 Token 交换和 `/connect` 签发。它的 `webserver/request` 监听器仅在 `/api/remote.mux` 上认领自己的 API Peer，保留每个 API Peer 一个 mux 会话、重复 409，以及在异步清理前同步撤销凭据的行为。Inspector 与其他路由不认领该生命周期。WebApp 拥有就绪、`printUrl` 与 `openBrowser`（两者默认 true）、SSH 抑制和发布：收集完整入口，按序打印，只打开首个可自动打开的入口。没有入口则不输出、不打开。
 
 ### 保留的协议与明确限制
 

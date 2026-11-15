@@ -1,7 +1,13 @@
 /** Native account commands and Gateway state stream; no renderer receives credentials. */
 import { randomUUID } from 'node:crypto'
-import WebSocket from 'ws'
-import { parseRemoteStreamServerMessage, REMOTE_STREAM_MUX_PATH } from '@deepseek-ai/dsh-api-gateway/stream-protocol'
+import {
+  parseRemoteStreamServerMessage,
+  parseRemoteStreamTransportFrame,
+  REMOTE_STREAM_MUX_PATH,
+  REMOTE_STREAM_SESSION_HEADER,
+  REMOTE_STREAM_SESSION_PARAM,
+  type RemoteStreamPongFrame,
+} from '@deepseek-ai/dsh-api-gateway/stream-protocol'
 import type { AccountClientMetadata, AccountView, SignInAttemptId } from '@deepseek-ai/dsh-deepseek-account/types'
 
 /** Authenticated unary caller shared with native onboarding. */
@@ -80,7 +86,7 @@ export interface DesktopAccountBackend {
  * Connect native account operations to the standard authenticated Web backend.
  * @param origin - Host Web origin.
  * @param invoke - validated unary RPC caller.
- * @param cookie - Host authentication Cookie header for the account WebSocket.
+ * @param cookie - Host authentication Cookie header for the account mux session.
  * @returns account operations; watch callers own their subscriptions.
  */
 export function desktopAccountBackend(origin: string, invoke: AccountInvoke, cookie: string): DesktopAccountBackend {
@@ -92,47 +98,122 @@ export function desktopAccountBackend(origin: string, invoke: AccountInvoke, coo
     cancel: attemptId => call('cancelSignIn', { attemptId }), signOut: client => call('signOut', { client }),
     watch(listener, failed, expired, onAnalyticsEnabledChanged) {
       let closed = false
-      let socket: WebSocket | undefined
+      let attempt: AbortController | undefined
       let retry: ReturnType<typeof setTimeout> | undefined
-      const connect = (): void => {
+      const watchMux = async (signal: AbortSignal): Promise<void> => {
         const streamId = randomUUID()
         const expiryStreamId = randomUUID()
         const analyticsPolicyStreamId = randomUUID()
-        const url = new URL(REMOTE_STREAM_MUX_PATH, origin)
-        url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
-        socket = new WebSocket(url, { headers: { cookie, origin }, maxPayload: 65_536 })
-        socket.on('open', () => {
-          if (onAnalyticsEnabledChanged !== undefined) socket?.send(JSON.stringify({ type: 'open', streamId: analyticsPolicyStreamId, endpoint: 'productAnalytics/watchPolicy', payload: { args: {} } }))
-          socket?.send(JSON.stringify({ type: 'open', streamId: expiryStreamId, endpoint: 'account/watchExpiry', payload: { args: {} } }))
-          socket?.send(JSON.stringify({ type: 'open', streamId, endpoint: 'account/watch', payload: { args: {} } }))
-        })
-        socket.on('message', (data) => {
-          try {
-            const bytes = Array.isArray(data) ? Buffer.concat(data) : Buffer.isBuffer(data) ? data : Buffer.from(data)
-            const frame = parseRemoteStreamServerMessage(bytes.toString('utf8'))
-            if (frame.streamId === analyticsPolicyStreamId) {
-              if (frame.type === 'item' && typeof frame.value === 'boolean') onAnalyticsEnabledChanged?.(frame.value)
-              else onAnalyticsEnabledChanged?.(false)
-              return
+        const downlink = new URL(REMOTE_STREAM_MUX_PATH, origin)
+        const response = await fetch(downlink, { headers: { accept: 'text/event-stream', cookie }, signal })
+        const session = response.headers.get(REMOTE_STREAM_SESSION_HEADER)
+        if (!response.ok || response.body === null || session === null) {
+          throw new Error(`desktop account: mux downlink was refused with status ${String(response.status)}`)
+        }
+        const uplink = new URL(downlink)
+        uplink.searchParams.set(REMOTE_STREAM_SESSION_PARAM, session)
+        // Frames leave in one request per batch, so their order survives.
+        const post = async (frames: readonly object[]): Promise<void> => {
+          if (frames.length === 0) return
+          const posted = await fetch(uplink, {
+            method: 'POST',
+            headers: { cookie, 'content-type': 'application/x-ndjson' },
+            body: frames.map(frame => JSON.stringify(frame)).join('\n'),
+            signal,
+          })
+          if (!posted.ok) throw new Error(`desktop account: mux uplink was refused with status ${String(posted.status)}`)
+        }
+        // Logical streams share this session; open them in one batch before reading.
+        await post([
+          ...(onAnalyticsEnabledChanged === undefined ? [] : [
+            { type: 'open', streamId: analyticsPolicyStreamId, endpoint: 'productAnalytics/watchPolicy', payload: { args: {} } },
+          ]),
+          { type: 'open', streamId: expiryStreamId, endpoint: 'account/watchExpiry', payload: { args: {} } },
+          { type: 'open', streamId, endpoint: 'account/watch', payload: { args: {} } },
+        ])
+        for await (const text of muxFrames(response.body)) {
+          const transport = parseRemoteStreamTransportFrame(text)
+          if (transport !== undefined) {
+            // Answering a liveness ping over the uplink keeps the session open.
+            if (transport.type === 'ping') {
+              const pong: RemoteStreamPongFrame = { type: 'pong' }
+              await post([pong])
             }
-            if (frame.streamId === expiryStreamId && frame.type === 'item' && frame.value === 'session-expired') { expired(); return }
-            if (frame.streamId !== streamId) throw new Error('desktop account: unexpected stream')
-            if (frame.type === 'item') {
-              const update = frame.value
-              if (typeof update !== 'object' || update === null || !('type' in update)
-                || (update.type !== 'snapshot' && update.type !== 'credentials-changed') || !('state' in update)) {
-                throw new Error('desktop account: invalid stream update')
-              }
-              listener(accountView(update.state))
-            }
-            else socket?.close()
-          } catch { socket?.close() }
+            continue
+          }
+          const frame = parseRemoteStreamServerMessage(text)
+          if (frame.streamId === analyticsPolicyStreamId) {
+            if (frame.type === 'item' && typeof frame.value === 'boolean') onAnalyticsEnabledChanged?.(frame.value)
+            else onAnalyticsEnabledChanged?.(false)
+            continue
+          }
+          if (frame.streamId === expiryStreamId && frame.type === 'item' && frame.value === 'session-expired') { expired(); continue }
+          if (frame.streamId !== streamId) throw new Error('desktop account: unexpected stream')
+          if (frame.type !== 'item') break
+          const update = frame.value
+          if (typeof update !== 'object' || update === null || !('type' in update)
+            || (update.type !== 'snapshot' && update.type !== 'credentials-changed') || !('state' in update)) {
+            throw new Error('desktop account: invalid stream update')
+          }
+          listener(accountView(update.state))
+        }
+        throw new Error('desktop account: mux session ended')
+      }
+      const connect = (): void => {
+        const controller = new AbortController()
+        attempt = controller
+        void watchMux(controller.signal).catch(() => {
+          // A lost session fails the subscription once and reconnects on a timer;
+          // every logical stream reopens on the next attempt.
+          if (closed) return
+          onAnalyticsEnabledChanged?.(false)
+          failed()
+          retry = setTimeout(connect, 1000)
         })
-        socket.on('error', () => { socket?.close() })
-        socket.on('close', () => { if (!closed) { onAnalyticsEnabledChanged?.(false); failed(); retry = setTimeout(connect, 1000) } })
       }
       connect()
-      return () => { closed = true; onAnalyticsEnabledChanged?.(false); clearTimeout(retry); socket?.close() }
+      return () => { closed = true; onAnalyticsEnabledChanged?.(false); clearTimeout(retry); attempt?.abort() }
     },
+  }
+}
+
+/**
+ * Decode one `text/event-stream` downlink body into frame bodies.
+ * @param body - downlink body reader source.
+ * @returns every complete frame body, in arrival order.
+ */
+async function* muxFrames(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+  const decoder = new TextDecoder()
+  const reader = body.getReader()
+  const data: string[] = []
+  let pending = ''
+  const drain = (text: string): string[] => {
+    pending += text
+    const frames: string[] = []
+    let end = pending.indexOf('\n')
+    while (end !== -1) {
+      const line = pending.slice(0, end).replace(/\r$/, '')
+      pending = pending.slice(end + 1)
+      end = pending.indexOf('\n')
+      // A blank line dispatches the fields collected for this event.
+      if (line === '') {
+        if (data.length > 0) frames.push(data.join('\n'))
+        data.length = 0
+        continue
+      }
+      // A leading colon is a comment, the shape Host heartbeats take as events.
+      if (line.startsWith(':')) continue
+      if (line.startsWith('data:')) data.push(line.slice('data:'.length).replace(/^ /, ''))
+    }
+    return frames
+  }
+  try {
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) return
+      for (const frame of drain(decoder.decode(value, { stream: true }))) yield frame
+    }
+  } finally {
+    void reader.cancel().catch(() => undefined)
   }
 }

@@ -1,7 +1,5 @@
 /** Real Loader composition exercises Token as an independent authentication plugin. */
 import { request as httpRequest } from 'node:http'
-import { once } from 'node:events'
-import type { Duplex } from 'node:stream'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
@@ -81,25 +79,33 @@ it('serves token exchanges through WebServer and keeps token-owned Peers outside
   const page = await fetch(new URL('/page.html', login), { headers: { cookie: apiCookie! } })
   expect(page.status).toBe(200)
   expect(await page.json()).toEqual({ id: api.peer.id })
-  ctx.effect(() => ctx.webServer.registerUpgrade({
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
     path: '/api/remote.mux',
-    handler(_request, socket) {
-      socket.write('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: fixture\r\n\r\n')
+    auth: 'required',
+    // The Gateway owns this lifetime; the fixture mirrors it so a disposed Peer ends the downlink.
+    handler(_request, response, peer) {
+      response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store' })
+      response.flushHeaders()
+      peer?.ctx.effect(() => () => { response.destroy() })
     },
   }))
-  const socket = await new Promise<Duplex>((resolve, reject) => {
-    const request = httpRequest(new URL('/api/remote.mux', origin), {
-      headers: { cookie: apiCookie!, connection: 'Upgrade', upgrade: 'fixture' },
-    })
-    request.once('upgrade', (_response, socket) => { resolve(socket) })
-    request.once('error', reject)
-    request.end()
+  const downlink = await fetch(new URL('/api/remote.mux', origin), {
+    headers: { cookie: apiCookie!, accept: 'text/event-stream' },
   })
-  socket.resume()
-  const closed = once(socket, 'close')
-  onTestFinished(async () => { socket.destroy(); await closed })
+  expect(downlink.status).toBe(200)
+  const body = downlink.body
+  if (body === null) throw new Error('fixture mux downlink carried no body')
+  const ended = (async () => {
+    try {
+      for await (const chunk of body) void chunk
+    } catch {
+      // A disposed Peer destroys the response mid-stream.
+    }
+  })()
+  onTestFinished(() => { void body.cancel().catch(() => undefined) })
   await api.peer.dispose()
-  await closed
+  await ended
   expect((await fetch(new URL('/page.html', login), { headers: { cookie: apiCookie! } })).status).toBe(401)
   expect(ctx.connection.admit({ headers: apiHeaders })).toEqual({ rejection: 401 })
 

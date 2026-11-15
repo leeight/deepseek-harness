@@ -8,7 +8,7 @@ English | [中文](2026-09-19-remote-duplex-stream.zh.md)
 
 ### Current state
 
-`dsh-api-gateway` multiplexes Typert Remote streams over one WebSocket at `/api/remote.mux`. A Host method declares both directions with `@Remote({ mode: 'stream' })` and `RemoteStream<Out, In>`; the generated Client method returns `RemoteStreamHandle<Out, In>`. Existing `Iterable` and `AsyncIterable` return types declare downlink-only methods. The optional final `signal: AbortSignal` is supplied by the Gateway and does not enter the wire arguments.
+`dsh-api-gateway` multiplexes Typert Remote streams over one mux session at `/api/remote.mux`, whose carrier is the [HTTP event stream](2026-11-13-http-stream-mux.md): one `GET` downlink and session-addressed `POST` uplinks. A Host method declares both directions with `@Remote({ mode: 'stream' })` and `RemoteStream<Out, In>`; the generated Client method returns `RemoteStreamHandle<Out, In>`. Existing `Iterable` and `AsyncIterable` return types declare downlink-only methods. The optional final `signal: AbortSignal` is supplied by the Gateway and does not enter the wire arguments.
 
 Both directions share one `streamId`:
 
@@ -137,7 +137,7 @@ export interface RemoteInvocation {
   readonly service: string
   /** The Peer that initiated the call; every carrier names it explicitly. */
   readonly peer: PeerScope
-  /** Carrier cancellation: Client cancel, socket closure, uplink failure. */
+  /** Carrier cancellation: Client cancel, carrier closure, uplink failure. */
   readonly signal: AbortSignal
   readonly uplinkWindow?: RemoteUplinkWindow | undefined
   /**
@@ -199,9 +199,9 @@ export interface PeerScope {
 | Member | Semantics |
 | --- | --- |
 | `connection.browserPeer: PeerScope` | The Peer every authenticated browser connection shares; owner principal; lives and dies with the Connection |
-| `connection.admit(request): PeerAdmission` | Checks Host/Origin and signed browser or API Cookies; returns `{ rejection: 401 \| 403 }` or the credential's live Peer; connect publishes the API Peer and its lifecycle socket releases it |
+| `connection.admit(request): PeerAdmission` | Checks Host/Origin and signed browser or API Cookies; returns `{ rejection: 401 \| 403 }` or the credential's live Peer; connect publishes the API Peer and the close of its mux downlink releases it |
 
-The Gateway's `handleUpgrade(req, socket, head, peer)` binds an opener with a fixed Peer to that socket and registers socket closure in `peer.ctx.effect`; when the scope is already inactive, it closes the socket directly with 1001 instead. `InvokeRemoteRequest.peer` and the `peer` parameter of `RemoteStreamOpener` and `wireStream.open` are required, so every in-process caller names its Peer, and the Gateway creates none. Looking up a Peer by id and Peer open and close events wait until the first consumer that needs them appears.
+The Gateway's `handleDownlink(req, res, peer)` binds an opener with a fixed Peer to that response and registers response closure in `peer.ctx.effect`; when the scope is already inactive, it destroys the response instead. `InvokeRemoteRequest.peer` and the `peer` parameter of `RemoteStreamOpener` and `wireStream.open` are required, so every in-process caller names its Peer, and the Gateway creates none. Looking up a Peer by id and Peer open and close events wait until the first consumer that needs them appears.
 
 The Peer carries its principal; what that principal may call is decided by the roles, bindings, and policies that [Peer principals and method-level Remote access control](../../implemented/architecture/2026-10-12-peer-principal-and-remote-access.md) defines.
 
@@ -220,7 +220,7 @@ export interface RemoteStreamHandle<Out, In> extends AsyncIterable<Out> {
 ```
 
 - The handle represents one generation. When the carrier is lost, `for await` fails with `RemoteStreamCarrierError` and the handle ends there; whether to reopen, and with which arguments, belongs to the upper-layer protocol.
-- `send` is synchronous: it runs the `isRemoteJsonValue` check before enqueuing and throws synchronously on a value that is not lossless JSON. The browser's `WebSocket.send` has no write callback, so throttling sends would be meaningless; the Host-side inbox limit is the only backpressure point.
+- `send` is synchronous: it runs the `isRemoteJsonValue` check before enqueuing and throws synchronously on a value that is not lossless JSON. The carrier posts queued frames from one serial pump, so `send` only enqueues and the Host-side inbox limit is the only backpressure point.
 - When a terminal frame (`end` / `error`) arrives, the mux client stops the pump and closes the uplink queue immediately on the receive path, so later `send` / `end` throw without waiting for the consumer's next read.
 - `dispose()` calls `return()` on the carrier iterator, so the `cancel` frame is sent even when nobody is reading the downlink; afterwards the handle's `next()` ends immediately and buffered items are dropped. A consumer that `break`s out of `for await` early is equivalent to `dispose()`.
 - The `$stream` supervisor, `RemoteSnapshotStream`, and `RemoteJournalStream` are upper-layer tools outside the transport layer. The object their `open` factories receive is the handle itself, with unchanged `for await` behavior; exposing `send` to these upper-layer protocols is deferred.
@@ -241,7 +241,7 @@ export type RemoteStreamServerMessage =
   | { readonly type: 'end'; readonly streamId: string }
 ```
 
-Parsing rules: `item` has exactly the keys `type` and `streamId` plus an optional `value`, and `value` must be a lossless JSON value (`isRemoteJsonValue`); `end` has exactly the keys `type` and `streamId`. Any other frame is a frame-format violation, and the socket closes with 1008. No binary frames are introduced.
+Parsing rules: `item` has exactly the keys `type` and `streamId` plus an optional `value`, and `value` must be a lossless JSON value (`isRemoteJsonValue`); `end` has exactly the keys `type` and `streamId`. Any other frame is a frame-format violation, and the Host answers 400 and terminates the mux session. No binary frames are introduced.
 
 ### Logical stream state machine
 
@@ -254,7 +254,7 @@ Parsing rules: `item` has exactly the keys `type` and `streamId` plus an optiona
                                   │ item frame: inbox.push           │ item frame: inbox.push
                                   │ end frame: inbox.end             │ end frame: inbox.end (uplink half-close)
                                   │                                  │ method yield: sends item frame
-                                  │ cancel frame / socket close ────▶│ cancel frame / socket close: control.abort
+                                  │ cancel frame / carrier close ───▶│ cancel frame / carrier close: control.abort
                                   ▼                                  ▼
                                aborted ◀───────────────────────── finished (sends end or error frame)
 ```
@@ -264,7 +264,7 @@ Parsing rules: `item` has exactly the keys `type` and `streamId` plus an optiona
 #### Client side
 
 ```
-   call generated method ──▶ await socket ──▶ send open ──▶ handle usable
+   call generated method ──▶ await carrier ──▶ send open ──▶ handle usable
                                                             │ send(v): sends item; end(): sends end
                                                             │ downlink: inbox.next() → yield; end → ends; error → throws
                                                             │ downlink terminates first: send/end throw
@@ -279,9 +279,9 @@ Parsing rules: `item` has exactly the keys `type` and `streamId` plus an optiona
 | Still open | The Host method finishes and sends `end` | The Client handle terminates, and later `send` / `end` throw; the Host calls `return()` on the `uplink` iterator and drops unconsumed items |
 | Still open | The Host method throws and sends `error` | Same as above; the Client downlink fails with `RemoteError` |
 | Client `dispose` or signal abort | Any | Sends `cancel`; the Host runs `control.abort()`, `cancellableStream` closes `uplink` first and then calls `return()` on the method iterator; no terminal frame is sent |
-| Socket closes | Any | The Host aborts every stream and awaits `done`; on the Client every stream fails with `RemoteStreamCarrierError` |
-| `item` received after `end` | Any | The stream fails with a `gateway/protocol` error frame and aborts; the socket stays open |
-| `item` / `end` with an unknown `streamId` | Any | Ignored, like `cancel`: after the Host ends a stream and deletes its id, uplink frames still in flight from the Client are normal and must not take down the other streams on the same socket |
+| The carrier closes | Any | The Host aborts every stream and awaits `done`; on the Client every stream fails with `RemoteStreamCarrierError` |
+| `item` received after `end` | Any | The stream fails with a `gateway/protocol` error frame and aborts; the session stays open |
+| `item` / `end` with an unknown `streamId` | Any | Ignored, like `cancel`: after the Host ends a stream and deletes its id, uplink frames still in flight from the Client are normal and must not take down the other streams on the same session |
 
 ### Cancellation wait lifetime
 
@@ -291,11 +291,11 @@ The Host downlink clears its current reject callback after each read and checks 
 
 ### Ordering guarantees
 
-Frames on one socket arrive in total order: a logical stream's `open`, `item`…, `end` reach the Host in send order, and uplink items enter `uplink()` in the order of `send`. There is no cross-direction ordering guarantee between uplink and downlink; a protocol that needs request-response pairing carries its own sequence numbers.
+Frames on one session arrive in total order: the Client's single uplink pump posts batches one at a time, so a logical stream's `open`, `item`…, `end` reach the Host in send order, and uplink items enter `uplink()` in the order of `send`. There is no cross-direction ordering guarantee between uplink and downlink; a protocol that needs request-response pairing carries its own sequence numbers.
 
 ### Backpressure
 
-WebSocket has no per-stream window like HTTP/2: one connection is one serial write chain, and a slow stream holds up the other streams on the same connection. This property of the downlink is unchanged. For the uplink:
+Neither carrier has a per-stream window like HTTP/2: one session is one serial write chain, and a slow stream holds up the other streams on the same session. This property of the downlink holds on the event stream, where one response buffer serves every stream. For the uplink:
 
 **A bounded inbox plus whole-stream failure.** The Host meters each logical stream's inbox in UTF-8 bytes of its frames, with the limit set by the Gateway config `streamInboxBytes` (default 262144) and applied to every stream. On overflow the whole logical stream fails with `gateway/uplink-overflow`: the downlink breaks with it, an `error` frame goes to the Client, and the `uplink()` iterator ends with the same error. No data is discarded; a method that does not read its uplink while the Client keeps sending is a usage error, and the failure exposes it explicitly.
 
@@ -305,11 +305,11 @@ Credit frames wait until a consumer that needs sustained high-volume uplink appe
 
 | Item | Rule |
 | --- | --- |
-| Authentication | WebServer admission supplies the Peer at upgrade; descriptor and lookup-parameter validation runs at open. Uplink items belong to an already authenticated stream and are not authenticated again |
-| Peer | Admitted at upgrade as one `PeerScope`; `invocation.peer` of every stream on that socket is that Peer |
+| Authentication | WebServer admission supplies the Peer at downlink admission; descriptor and lookup-parameter validation runs at open. Uplink items belong to an already authenticated stream and are not authenticated again |
+| Peer | Admitted with the downlink as one `PeerScope`; `invocation.peer` of every stream on that session is that Peer, and an uplink post must carry the same Peer |
 | Item validation | With an uplink codec, every item is decoded strictly, and a failure fails the whole stream with the existing `gateway/input-invalid` (details `{ endpoint, field: 'uplink' }`); without a codec, only JSON-safety validation applies |
-| Frame size | A single frame keeps the `maxPayload` of `ws`; the inbox limit bounds the accumulated total |
-| Frame compression | Each connection negotiates `permessage-deflate` when the Gateway config `websocketCompression` is `'deflate'` (the default); frames below 1,024 characters are sent uncompressed. See [the compression decision](2026-10-18-websocket-permessage-deflate.md) |
+| Frame size | One uplink post is capped at 16 MiB (`REMOTE_STREAM_UPLINK_MAX_BYTES`) with 413 above it; the inbox limit bounds the accumulated total |
+| Frame compression | Neither direction is compressed: the web server skips `text/event-stream` in its gzip middleware, so frames travel as JSON text. See [the carrier decision](2026-11-13-http-stream-mux.md) |
 
 ### In-process and worker carriers
 
@@ -393,8 +393,6 @@ export type RemoteStreamOpener = (
 // index.ts Config addition
 /** Uplink inbox limit per logical stream, in UTF-8 bytes of frames (default 262144). */
 readonly streamInboxBytes?: number
-/** Per-message WebSocket compression; 'none' disables the extension (default 'deflate'). */
-readonly websocketCompression?: 'none' | 'deflate'
 ```
 
 `prepareInvocation`:
@@ -433,13 +431,13 @@ class UplinkInbox implements AsyncIterable<unknown>, AsyncIterator<unknown> {
 `receive(text)` dispatch:
 
 ```
-open   : exists → throw (socket 1008); otherwise create { control, inbox, done } and start the pump
+open   : exists → throw (400, session terminated); otherwise create { control, inbox, done } and start the pump
 item   : missing → ignore; otherwise inbox.push(value, bytes)
 end    : missing → ignore; otherwise inbox.end()
 cancel : missing → ignore; otherwise control.abort(new Error('Remote stream cancelled'))
 ```
 
-`pump` passes the inbox and the socket's Peer to the opener and calls `inbox.fail(...)` in its `finally`. An abort whose reason is a `RemoteError` is sent by the pump as an `error` frame (a failure raised by the Gateway or the mux); an abort whose reason is a plain `Error` (cancel, socket closure) sends no terminal frame.
+`pump` passes the inbox and the session's Peer to the opener and calls `inbox.fail(...)` in its `finally`. An abort whose reason is a `RemoteError` is sent by the pump as an `error` frame (a failure raised by the Gateway or the mux); an abort whose reason is a plain `Error` (cancel, carrier closure) sends no terminal frame.
 
 ### Gateway Client (`packages/api/gateway/src/client`)
 
@@ -456,7 +454,7 @@ cancel : missing → ignore; otherwise control.abort(new Error('Remote stream ca
 | `dsh-typert-registry` | Load-time validation that `uplink.codec` is a valid strict codec |
 | `dsh-typert-generator` (`model.ts`, `analyzer.ts`, `emitter.ts`) | `remoteResultType` recognizes `RemoteStream<Out, In>` and generates the `uplink` boundary; the descriptor emits `uplink: { codec }`; the generated Client signature returns `RemoteStreamHandle<Out, In>`; the parameter loop accepts only business parameters and a final `signal` |
 | `dsh-client-connection` (`peer.ts`, `rpc.ts`, `rpc-host.ts`, `index.ts`) | The `Peer` class; `connection.browserPeer` and `admit`; the `/api` and upgrade routes obtain the Peer through `admit`; the optional `uplink` of `rpc.open` |
-| `dsh-api-gateway` Host (`stream-protocol.ts`, `stream-server.ts`, `types.ts`, `index.ts`) | `item` / `end` frames; `UplinkInbox`; `Config.streamInboxBytes` and `Config.websocketCompression`; `GatewayInvocation` and `extend({ invocation })`; `UplinkDecoder`; `handleUpgrade(req, socket, head, peer)` |
+| `dsh-api-gateway` Host (`stream-protocol.ts`, `stream-server.ts`, `types.ts`, `index.ts`) | `item` / `end` frames; `UplinkInbox`; `Config.streamInboxBytes` and `Config.streamHeartbeatIntervalMs`; `GatewayInvocation` and `extend({ invocation })`; `UplinkDecoder`; `handleDownlink(req, res, peer)` and `handleUplink(req, res, peer)` |
 | `dsh-api-gateway` Client (`client/index.ts`, `client/stream-client.ts`) | `invokeStream` returns the handle; the uplink pump is driven by the handle's queue |
 | `dsh-webworker-runtime`, `dsh-remote-mock` | The worker tunnel's two uplink frames and the `serveStream` assembly; `StreamHandle.uplink`; the direct proxy returns the real handle |
 | Documentation | The READMEs of gateway, the api group, connection, protocol, and generator; `docs/api-gateway`; the type-equiv blocks of `docs/subsystems/typert`; the config and Cordis catalogs |
@@ -531,7 +529,7 @@ New codes are registered in `packages/api/gateway/src/remote-error-codes.ts` and
 
 ## Minimal echo method
 
-`packages/api/gateway/tests/echo-stream.host.spec.ts` runs the same method through the WebSocket carrier and through the in-process carrier:
+`packages/api/gateway/tests/echo-stream.host.spec.ts` runs the same method through the HTTP carrier (`MuxSocket`) and through the in-process carrier:
 
 ```text
 class EchoService extends TypertRemoteService {
@@ -590,14 +588,14 @@ for await (const reply of stream) replies.push(reply)   // ['> a', '> b']
 - **Every browser connection shares `browserPeer`**, and `admit` is the only network admission point; in-process code creates further Peers with `connection.createPeer()`.
 - **No cross-direction ordering guarantee between uplink and downlink**; a protocol that needs request-response pairing carries its own sequence numbers.
 - **Upper-layer supervisors expose only the downlink**: `$stream`, snapshot and journal do not expose `send`; a domain that writes uplink retains its generated physical handle for that generation.
-- **The worker tunnel behaves differently from the WebSocket carrier**: no inbox limit, and items after `end` are dropped, because page to worker is a same-origin trusted boundary.
+- **The worker tunnel behaves differently from the HTTP carrier**: no inbox limit, and items after `end` are dropped, because page to worker is a same-origin trusted boundary.
 
 ## Testing
 
 Retention cases in `gateway-stream.host.spec.ts` and `gateway.client.spec.ts` count live iterator results after a full GC while the streams remain open. Lifecycle cases cover normal close waking multiple pending uplink reads, cancellation between reads, synchronous abort followed by a source exception, and termination during a Client send.
 
-- `packages/api/gateway/tests/echo-stream.host.spec.ts`: the same echo method passes through the WebSocket carrier and through the in-process carrier.
-- Gateway Host: exact-key validation in frame parsing; `UplinkInbox` buffering during opening, `item` after `end`, overflow, ignored unknown `streamId`, and cleanup on socket closure; `UplinkDecoder` delivery with and without a codec and abort on decode failure; `uplink()` taken only once; the `extend({ invocation })` view and the origin of `peer`; `cancellableStream` closing the uplink before `return()`.
+- `packages/api/gateway/tests/echo-stream.host.spec.ts`: the same echo method passes through the HTTP carrier and through the in-process carrier.
+- Gateway Host: exact-key validation in frame parsing; `UplinkInbox` buffering during opening, `item` after `end`, overflow, ignored unknown `streamId`, and cleanup on carrier closure; `UplinkDecoder` delivery with and without a codec and abort on decode failure; `uplink()` taken only once; the `extend({ invocation })` view and the origin of `peer`; `cancellableStream` closing the uplink before `return()`.
 - Gateway Client: the handle's `send` (JSON validation, queued before open, throws after termination), idempotent `end`, `dispose` driving the `cancel` frame and ending later reads; the pump's three exits; the pump stopping as soon as a terminal frame arrives.
 - typert: the analyzer's handling of `RemoteStream<Out, In>`, `RemoteStream<Out>`, `never`, and the existing `AsyncIterable<Out>`; decorator options; registry load-time validation.
 - connection: the three outcomes of `admit`, 401, 403, and `browserPeer`; `browserPeer` reaching handlers through the bridge and the shared handler; release with the Connection.

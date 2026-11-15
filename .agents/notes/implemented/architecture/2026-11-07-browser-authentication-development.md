@@ -99,7 +99,7 @@ The account plugin registers a temporary callback listener before generic admiss
 
 ### Keep Socket policy with the issuing product
 
-Token's listener sits beside its `/connect` route and acts only on `/api/remote.mux`. It recognizes its own API Peer by map identity, rejects a second mux Socket with409, and synchronously removes the credential before awaiting Peer and Socket cleanup. Closing an Inspector CDP Socket does not claim or revoke that API session. Other Providers retain their own lifetime policies; Gateway only performs protocol upgrade with the supplied Peer.
+Token's listener sits beside its `/connect` route and acts only on `/api/remote.mux`. It recognizes its own API Peer by map identity, rejects a second mux downlink with 409, and synchronously removes the credential before awaiting Peer and response cleanup. Closing an Inspector CDP Socket does not claim or revoke that API session. Other Providers retain their own lifetime policies; Gateway only dispatches the mux route with the supplied Peer.
 
 An upgrade fixes the Peer for that connection. Later HTTP requests authenticate again. Token's shared browser Peer survives individual Socket closure; an API Peer follows its existing mux lifetime. Already-admitted unary calls retain their cancellation scope. The [mux regression](../../../../packages/api/gateway/tests/operator-connect.host.spec.ts) and [API connect decision](2026-10-09-operator-scoped-connect-handshake.md) cover this distinction.
 

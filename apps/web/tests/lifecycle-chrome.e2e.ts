@@ -3,7 +3,7 @@
 // One tiny recorded turn (text-only) drives the whole spec: the empty-state
 // hero materializes a real Workspace + Session on first send (the jsdom
 // workspace-flow suite pins the object-layer state machine over the fixture
-// client; THIS spec pins the same flow through HTTP RPC + WebSocket + the host
+// client; THIS spec pins the same flow through HTTP RPC + the HTTP mux + the host
 // gateway), reload replays everything from the log (zero further model
 // calls), and the theme scenario proves the shipped dark palette actually
 // cascades: attribute -> alias token flip -> painted surface change. No
@@ -13,7 +13,7 @@
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
-import type { Browser, Page, WebSocketRoute } from 'playwright'
+import type { Browser, Page } from 'playwright'
 import { chromium } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed, onTestFinished } from 'vitest'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
@@ -22,6 +22,7 @@ import {
   captureStableAria, compareOrRefreshGolden, fixtureUserPrompts,
   launchWebScaffold, recordFixture, watchConsole, webSnapshotMode, type WebScaffold,
 } from './scaffold.ts'
+import { installMuxProbe } from './mux.ts'
 import {
   connectFreshWorkspace, connectFreshWorkspaceZh, expandOwningTurnProcess, newEnglishPage, saveFailureShot,
   writeComposerDraft, ZH_BROWSER_LOCALE,
@@ -492,21 +493,16 @@ describe('web e2e: lifecycle & chrome (workspace flow / reload / dark mode)', ()
   it.skipIf(MODE === 'record')('shows automatic and user-requested connection recovery beside Settings', async () => {
     const recoveryPage = await newEnglishPage(browser)
     const recoveryTripwire = watchConsole(recoveryPage)
-    const sockets: WebSocketRoute[] = []
-    let rejectConnections = false
-    let holdConnections = false
-    await recoveryPage.routeWebSocket('**/api/remote.mux', (route) => {
-      sockets.push(route)
-      if (rejectConnections || holdConnections) return
-      route.connectToServer()
-    })
+    // While carriers are withheld the probe answers attempts itself: the carrier opens and stays silent, so only
+    // the retry timer or the indicator's reconnect action can replace it.
+    const mux = await installMuxProbe(recoveryPage)
     onTestFailed(() => saveFailureShot(recoveryPage, 'web-e2e-connection-recovery'))
     try {
       await recoveryPage.clock.install()
       await recoveryPage.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
       await recoveryPage.waitForSelector('[class*="frame"]', { timeout: 30_000 })
-      await expect.poll(() => sockets.length).toBe(1)
-      rejectConnections = true
+      await expect.poll(() => mux.connections()).toBe(1)
+      await mux.hold(true)
       await recoveryPage.context().setOffline(true)
       await expect.poll(() => recoveryPage.evaluate(() => navigator.onLine)).toBe(false)
       const offline = recoveryPage.getByRole('button', {
@@ -514,7 +510,7 @@ describe('web e2e: lifecycle & chrome (workspace flow / reload / dark mode)', ()
       })
       await offline.waitFor({ timeout: 2_000 })
       await recoveryPage.clock.fastForward(60_000)
-      expect(sockets).toHaveLength(1)
+      expect(await mux.connections()).toBe(1)
 
       await recoveryPage.context().setOffline(false)
       await expect.poll(() => recoveryPage.evaluate(() => navigator.onLine)).toBe(true)
@@ -533,12 +529,12 @@ describe('web e2e: lifecycle & chrome (workspace flow / reload / dark mode)', ()
 
       for (let count = 2; count <= 9; count++) {
         await recoveryPage.clock.fastForward(10_000)
-        await expect.poll(() => sockets.length).toBe(count)
+        await expect.poll(() => mux.connections()).toBe(count)
         if (count === 2) {
           await recoveryPage.clock.fastForward(1_000)
-          expect(sockets).toHaveLength(count)
+          expect(await mux.connections()).toBe(count)
         }
-        await sockets.at(-1)!.close({ code: 4001, reason: 'connection recovery test' })
+        await mux.kill()
         // Drain the close event's promise continuations before advancing the next retry timer.
         await recoveryPage.evaluate(() => {})
       }
@@ -567,30 +563,30 @@ describe('web e2e: lifecycle & chrome (workspace flow / reload / dark mode)', ()
       })).toEqual(expectedColors)
       expect(await indicator.locator('svg').count()).toBe(1)
       expect(await indicator.getAttribute('title')).toBeNull()
-      rejectConnections = false
+      await mux.hold(false)
       await recoveryPage.clock.fastForward(10_000)
-      await expect.poll(() => sockets.length).toBe(10)
+      await expect.poll(() => mux.connections()).toBe(10)
       const automaticRecovery = recoveryPage.getByRole('status')
       await automaticRecovery.waitFor({ timeout: 10_000 })
       expect(await automaticRecovery.innerText()).toBe('Connected')
       await recoveryPage.clock.fastForward(2_000)
       await automaticRecovery.waitFor({ state: 'detached' })
 
-      holdConnections = true
-      await sockets.at(-1)!.close({ code: 4001, reason: 'manual recovery test' })
+      await mux.hold(true)
+      await mux.kill()
       await connecting.waitFor()
       await recoveryPage.clock.fastForward(500)
-      await expect.poll(() => sockets.length).toBe(11)
+      await expect.poll(() => mux.connections()).toBe(11)
       await indicator.hover()
       expect(await indicator.innerText()).toMatch(/^Reconnecting\.{1,3}$/)
       const hoverBackground = await indicator.evaluate(element => getComputedStyle(element).backgroundColor)
       await recoveryPage.mouse.down()
       await expect.poll(() => indicator.evaluate(element => getComputedStyle(element).backgroundColor))
         .not.toBe(hoverBackground)
-      holdConnections = false
+      await mux.hold(false)
       await recoveryPage.mouse.up()
 
-      await expect.poll(() => sockets.length).toBe(12)
+      await expect.poll(() => mux.connections()).toBe(12)
       const recovered = recoveryPage.getByRole('status')
       await recovered.waitFor({ timeout: 10_000 })
       expect(await recovered.innerText()).toBe('Connected')

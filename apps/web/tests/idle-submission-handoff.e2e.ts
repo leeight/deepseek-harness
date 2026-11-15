@@ -8,6 +8,7 @@ import type { SessionEvent } from '@deepseek-ai/dsh-session/types'
 import {
   parseRemoteStreamClientMessage, parseRemoteStreamServerMessage,
 } from '@deepseek-ai/dsh-api-gateway/stream-protocol'
+import { installMuxProbe, type MuxProbe } from './mux.ts'
 import { launchWebScaffold, seedSession, watchConsole, webSnapshotMode } from './scaffold.ts'
 import { newEnglishPage } from './support.ts'
 
@@ -17,43 +18,50 @@ const TEXT = 'IDLE_SUBMISSION_HANDOFF Keep this message in the conversation.'
 const HANDOFF_TIMEOUT_MS = 30_000
 
 interface Delivery {
+  readonly seq: number
   readonly stream: string
   readonly inbox?: InboxState
   readonly event?: SessionEvent
-  readonly send: () => void
 }
 
 /** Delay real Host frames while preserving FIFO within each logical stream. */
 class HistoryDeliveryGate {
   private readonly streams = new Map<string, string>()
   private buffered: Delivery[] = []
+  private mux: MuxProbe | undefined
   holding = false
 
   async install(page: Page): Promise<void> {
-    await page.routeWebSocket('**/api/remote.mux', (socket) => {
-      const server = socket.connectToServer()
-      socket.onMessage((message) => {
-        const frame = parseRemoteStreamClientMessage(String(message))
-        if (frame.type === 'open') this.streams.set(frame.streamId, frame.endpoint)
-        server.send(message)
-      })
-      server.onMessage((message) => {
-        const frame = parseRemoteStreamServerMessage(String(message))
-        const endpoint = this.streams.get(frame.streamId)
-        if (!this.holding || (endpoint !== 'session/control' && endpoint !== 'session/follow')) {
-          socket.send(message)
-          return
-        }
-        const control = endpoint === 'session/control' && frame.type === 'item'
-          ? frame.value as { type: string; sessionId?: string; changes?: readonly { key: string; val: unknown }[] } : undefined
-        const inbox = control?.type === 'projection' && control.sessionId === SESSION_ID
-          ? control.changes?.find(change => change.key === 'inbox')?.val as InboxState | undefined : undefined
-        const follow = endpoint === 'session/follow' && frame.type === 'item'
-          ? frame.value as { type: string; event?: SessionEvent } : undefined
-        this.buffered.push({ stream: frame.streamId, send: () => { socket.send(message) },
-          ...follow?.event === undefined ? {} : { event: follow.event }, ...inbox === undefined ? {} : { inbox } })
-      })
-    })
+    this.mux = await installMuxProbe(page, { gate: (message, _session, seq) => this.decide(message, seq) })
+  }
+
+  /**
+   * Decide whether one downlink frame reaches the application now.
+   *
+   * The endpoint comes from the uplink `open` frame of the same stream, so an unknown stream refreshes the map.
+   * @param message - Downlink frame text.
+   * @param seq - Probe sequence number the gate's release call uses.
+   * @returns Whether the frame passes or waits for {@link releaseThrough} or {@link releaseAll}.
+   */
+  private async decide(message: string, seq: number): Promise<'pass' | 'hold'> {
+    const frame = parseRemoteStreamServerMessage(message)
+    if (!this.streams.has(frame.streamId) && this.mux !== undefined) {
+      for (const text of (await this.mux.snapshot()).uplink) {
+        const open = parseRemoteStreamClientMessage(text)
+        if (open.type === 'open') this.streams.set(open.streamId, open.endpoint)
+      }
+    }
+    const endpoint = this.streams.get(frame.streamId)
+    if (!this.holding || (endpoint !== 'session/control' && endpoint !== 'session/follow')) return 'pass'
+    const control = endpoint === 'session/control' && frame.type === 'item'
+      ? frame.value as { type: string; sessionId?: string; changes?: readonly { key: string; val: unknown }[] } : undefined
+    const inbox = control?.type === 'projection' && control.sessionId === SESSION_ID
+      ? control.changes?.find(change => change.key === 'inbox')?.val as InboxState | undefined : undefined
+    const follow = endpoint === 'session/follow' && frame.type === 'item'
+      ? frame.value as { type: string; event?: SessionEvent } : undefined
+    this.buffered.push({ seq, stream: frame.streamId,
+      ...follow?.event === undefined ? {} : { event: follow.event }, ...inbox === undefined ? {} : { inbox } })
+    return 'hold'
   }
 
   inboxDelivery(queued: boolean, text = TEXT): Delivery | undefined {
@@ -69,20 +77,24 @@ class HistoryDeliveryGate {
   turnStartDelivery(): Delivery | undefined { return this.buffered.find(item => item.event?.type === 'turn/start') }
 
 
-  releaseThrough(target: Delivery): void {
-    let reached = false
-    this.buffered = this.buffered.filter((item) => {
-      if (reached || item.stream !== target.stream) return true
-      item.send()
-      reached = item === target
-      return false
-    })
+  /**
+   * Deliver every held frame of one stream up to and including the target.
+   * @param target - Last held frame to deliver.
+   * @returns Resolution once the probe handed the frames over.
+   */
+  async releaseThrough(target: Delivery): Promise<void> {
+    const index = this.buffered.indexOf(target)
+    if (index < 0) throw new Error('delivery is not buffered')
+    const released = this.buffered.slice(0, index + 1).filter(item => item.stream === target.stream)
+    this.buffered = this.buffered.filter(item => !released.includes(item))
+    await this.mux?.release(released.map(item => item.seq))
   }
 
-  releaseAll(): void {
+  /** Stop holding and deliver every remaining frame. */
+  async releaseAll(): Promise<void> {
     this.holding = false
-    for (const item of this.buffered) item.send()
     this.buffered = []
+    await this.mux?.release()
   }
 }
 
@@ -146,35 +158,35 @@ it.skipIf(webSnapshotMode() === 'record').each(['inbox-first', 'transcript-first
 
       if (order === 'transcript-first') {
         await poll(() => gate.turnStartDelivery()).toBeDefined()
-        gate.releaseThrough(gate.turnStartDelivery()!)
+        await gate.releaseThrough(gate.turnStartDelivery()!)
         await page.locator('[data-chat-flow-kind="turn-process"]').last().waitFor({ state: 'attached' })
         await poll(() => placement(page)).toMatchObject({ echo: 1, dock: 0, durable: 0 })
         trace.push({ phase: 'turn-start', ...await placement(page) })
         await poll(() => gate.admissionDelivery()).toBeDefined()
-        gate.releaseThrough(gate.admissionDelivery()!)
+        await gate.releaseThrough(gate.admissionDelivery()!)
         await poll(() => placement(page)).toMatchObject({ echo: 0, dock: 0, durable: 1 })
         trace.push({ phase: 'durable-before-inbox', ...await placement(page) })
       }
 
       await poll(() => gate.inboxDelivery(true)).toBeDefined()
-      gate.releaseThrough(gate.inboxDelivery(true)!)
+      await gate.releaseThrough(gate.inboxDelivery(true)!)
       await poll(() => placement(page)).toMatchObject({ echo: order === 'inbox-first' ? 1 : 0, dock: 0, durable: order === 'transcript-first' ? 1 : 0 })
       trace.push({ phase: 'inbox', ...await placement(page) })
 
       await poll(() => gate.inboxDelivery(false)).toBeDefined()
-      gate.releaseThrough(gate.inboxDelivery(false)!)
+      await gate.releaseThrough(gate.inboxDelivery(false)!)
       await poll(() => placement(page)).toMatchObject({ echo: order === 'inbox-first' ? 1 : 0, dock: 0, durable: order === 'transcript-first' ? 1 : 0 })
       trace.push({ phase: 'claim-projection', ...await placement(page) })
 
       if (order === 'inbox-first') {
         await poll(() => gate.turnStartDelivery()).toBeDefined()
-        gate.releaseThrough(gate.turnStartDelivery()!)
+        await gate.releaseThrough(gate.turnStartDelivery()!)
         await page.locator('[data-chat-flow-kind="turn-process"]').last().waitFor({ state: 'attached' })
         await poll(() => placement(page)).toMatchObject({ echo: 1, dock: 0, durable: 0 })
         trace.push({ phase: 'turn-start', ...await placement(page) })
       }
 
-      gate.releaseAll()
+      await gate.releaseAll()
       await poll(() => placement(page)).toMatchObject({ echo: 0, dock: 0, durable: 1 })
       trace.push({ phase: 'durable', ...await placement(page) })
       for (const entry of trace) {
@@ -186,7 +198,7 @@ it.skipIf(webSnapshotMode() === 'record').each(['inbox-first', 'transcript-first
       await cdp.detach()
       expect(tripwire.pageErrors).toEqual([])
     } finally {
-      gate.releaseAll()
+      await gate.releaseAll()
     }
   },
 )

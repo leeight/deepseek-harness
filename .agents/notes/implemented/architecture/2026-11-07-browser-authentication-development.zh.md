@@ -99,7 +99,7 @@ Waterfall 监听器处理请求时拥有响应或 Socket，否则等待 `next()`
 
 ### Socket 策略归凭据签发产品
 
-Token 监听器位于 `/connect` 路由旁，仅处理 `/api/remote.mux`。它按映射表对象身份识别自己的 API Peer，以409拒绝第二条 mux Socket，并在等待 Peer 和 Socket 清理前同步移除凭据。关闭 Inspector CDP Socket 不会认领或撤销该 API 会话。其他 Provider 保留各自生命周期策略；Gateway 只以传入的 Peer 执行协议升级。
+Token 监听器位于 `/connect` 路由旁，仅处理 `/api/remote.mux`。它按映射表对象身份识别自己的 API Peer，以 409 拒绝第二条 mux 下行，并在等待 Peer 和响应清理前同步移除凭据。关闭 Inspector CDP Socket 不会认领或撤销该 API 会话。其他 Provider 保留各自生命周期策略；Gateway 只以传入的 Peer 分派 mux 路由。
 
 Upgrade 为该连接固定 Peer，后续 HTTP 请求重新认证。Token 的浏览器共享 Peer 不随单条 Socket 关闭而结束，API Peer 则遵循已有 mux 生命周期。已经准入的一元调用保留自身取消作用域。[mux 回归](../../../../packages/api/gateway/tests/operator-connect.host.spec.ts)和 [API connect 决策](2026-10-09-operator-scoped-connect-handshake.zh.md)覆盖这个区别。
 

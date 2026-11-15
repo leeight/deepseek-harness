@@ -1,0 +1,16 @@
+# Bilingual-pair consistency record for guide.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write docs/upgrade-guide/v0.2.2-rc.3/remote-mux-http/guide.md
+/:
+  en: 5aa3774da6d65e4c
+  zh: 1f5338a651c46985
+/remote-stream-mux-moves-to-http:
+  en: 19a70c4d3e9395e8
+  zh: 9d4cb09d8177ad87
+/remote-stream-mux-moves-to-http/change:
+  en: b1d4da7d54c243c7
+  zh: 2a58924945bbfbcf
+/remote-stream-mux-moves-to-http/migration:
+  en: b811124fb798345d
+  zh: 0d3e748e0694699d

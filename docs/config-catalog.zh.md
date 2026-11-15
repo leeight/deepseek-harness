@@ -229,12 +229,10 @@ export interface Config {
 ```ts config-catalog
 /** Gateway transport configuration. */
 export interface Config {
-  /** WebSocket Ping interval from 1 through 2,147,483,647 milliseconds. @default 2000 */
-  readonly websocketHeartbeatIntervalMs?: number
+  /** Downlink liveness frame interval from 1 through 2,147,483,647 milliseconds. @default 2000 */
+  readonly streamHeartbeatIntervalMs?: number
   /** Buffered uplink frame bytes one logical stream may hold before it fails with `gateway/uplink-overflow`. @default 262144 */
   readonly streamInboxBytes?: number
-  /** Per-message compression for the Remote stream WebSocket; `'none'` disables the extension. @default 'deflate' */
-  readonly websocketCompression?: 'none' | 'deflate'
 }
 ```
 <!-- END GENERATED config-catalog:@deepseek-ai/dsh-api-gateway -->
@@ -1828,7 +1826,7 @@ export interface Config {
 ## `@deepseek-ai/dsh-host-authentication-token`
 
 - `inject`: `connection` · `connection.authentication` · `credentials`
-- `source`: [`packages/host/authentication-token/src/index.ts:16`](../packages/host/authentication-token/src/index.ts)
+- `source`: [`packages/host/authentication-token/src/index.ts:20`](../packages/host/authentication-token/src/index.ts)
 
 ```ts config-catalog
 /** Default browser and API cookie lifetime. */

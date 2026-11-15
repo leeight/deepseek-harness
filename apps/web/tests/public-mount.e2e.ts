@@ -3,6 +3,7 @@
 import type { Browser, Page } from 'playwright'
 import { chromium } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { installMuxProbe, type MuxProbe } from './mux.ts'
 import {
   launchWebScaffold, watchConsole, webSnapshotMode, WELCOME_NOTICE_COPY,
   type WebConsoleTripwire, type WebScaffold,
@@ -18,7 +19,7 @@ describe.skipIf(MODE === 'record')('web e2e: public mount through a prefix-strip
   let page: Page
   let tripwire: WebConsoleTripwire
   const requestUrls: string[] = []
-  const muxFrames: string[] = []
+  let mux: MuxProbe
 
   beforeAll(async () => {
     scaffold = await launchWebScaffold({
@@ -32,11 +33,7 @@ describe.skipIf(MODE === 'record')('web e2e: public mount through a prefix-strip
     })
     tripwire = watchConsole(page)
     page.on('request', (request) => { requestUrls.push(request.url()) })
-    page.on('websocket', (socket) => {
-      if (new URL(socket.url()).pathname !== `${MOUNT}api/remote.mux`) return
-      socket.on('framesent', (frame) => { muxFrames.push(`sent ${String(frame.payload)}`) })
-      socket.on('framereceived', (frame) => { muxFrames.push(`received ${String(frame.payload)}`) })
-    })
+    mux = await installMuxProbe(page)
     await page.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
     await page.waitForSelector('#root', { timeout: 30_000 })
   }, 120_000)
@@ -49,7 +46,7 @@ describe.skipIf(MODE === 'record')('web e2e: public mount through a prefix-strip
   /** Requests outside the mount: the proxy strips no prefix from them, so nothing answers. */
   const offMountRequests = (): string[] => requestUrls.filter(url => !url.startsWith(scaffold.baseUrl))
 
-  it('loads the shell, its plugin bundles, and the Gateway WebSocket under the mount', async () => {
+  it('loads the shell, its plugin bundles, and the Remote mux under the mount', async () => {
     const welcome = page.getByRole('dialog', { name: WELCOME_NOTICE_COPY.zh.title })
     await welcome.waitFor({ timeout: 15_000 })
     expect(new URL(page.url()).pathname).toBe(MOUNT)
@@ -72,15 +69,17 @@ describe.skipIf(MODE === 'record')('web e2e: public mount through a prefix-strip
     await welcome.waitFor({ state: 'detached', timeout: 15_000 })
 
     // The forward must be a live two-way pipe, not just a handshake: the page's
-    // opens reach the Host and its items come back over the same mounted socket.
-    await expect.poll(
-      () => muxFrames.some(frame => frame.startsWith('sent ') && frame.includes('"type":"open"')),
-      { timeout: 10_000 },
-    ).toBe(true)
-    await expect.poll(
-      () => muxFrames.some(frame => frame.startsWith('received ') && frame.includes('"type":"item"')),
-      { timeout: 10_000 },
-    ).toBe(true)
+    // opens reach the Host and its items come back over the same mounted mux.
+    // The probe only wraps `/api/remote.mux` fetches, so a recorded connection
+    // also proves the client reached the mux through the mount prefix.
+    expect(await mux.connections()).toBeGreaterThan(0)
+    expect(requestUrls.some(url => new URL(url).pathname === `${MOUNT}api/remote.mux`)).toBe(true)
+    await expect.poll(async () => (await mux.snapshot()).uplink.some(frame => frame.includes('"type":"open"')), {
+      timeout: 10_000,
+    }).toBe(true)
+    await expect.poll(async () => (await mux.snapshot()).downlink.some(frame => frame.includes('"type":"item"')), {
+      timeout: 10_000,
+    }).toBe(true)
     expect(tripwire.warnings).toEqual([])
     expect(tripwire.pageErrors).toEqual([])
   }, 60_000)

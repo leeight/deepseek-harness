@@ -1,5 +1,5 @@
 /** Desktop credential delivery and provider lifetime through the private IPC channel. */
-import { EventEmitter, once } from 'node:events'
+import { EventEmitter } from 'node:events'
 import { randomBytes } from 'node:crypto'
 import { Context } from '@deepseek-ai/cordis'
 import * as Connection from '@deepseek-ai/dsh-client-connection'
@@ -7,8 +7,8 @@ import WebServer from '@deepseek-ai/dsh-host-webserver'
 import TypertRegistry from '@deepseek-ai/dsh-typert-registry'
 import TypertGateway from '@deepseek-ai/dsh-api-gateway'
 import RemoteAccess from '@deepseek-ai/dsh-api-remote-access'
-import WebSocket from 'ws'
 import OperatorFixture from '../../../packages/api/gateway/tests/operator-connect-fixture.ts'
+import { openMuxCarrier } from './mux-carrier.ts'
 import { expect, it, onTestFinished, vi } from 'vitest'
 import { DesktopAuthenticationEnd, receiveDesktopSecret } from '../src/authentication.ts'
 import * as DesktopAuthentication from '@deepseek-ai/dsh-host-authentication-desktop'
@@ -154,18 +154,12 @@ it('authenticates real HTTP requests using its own Peer and withdraws with its o
   expect((await request(`dsh-desktop-session=${value}; dsh-desktop-session=${value}`)).status).toBe(401)
   expect(await request(`other=1; dsh-desktop-session=${value}`)).toEqual({ status: 200, body: desktopPeer.id })
   expect(await request(`dsh-desktop-session=${value}`)).toEqual({ status: 200, body: desktopPeer.id })
-  const socket = new WebSocket(`${origin.replace('http:', 'ws:')}/api/remote.mux`, {
-    headers: { cookie: `dsh-desktop-session=${value}` },
-  })
-  const closed = once(socket, 'close')
-  onTestFinished(async () => {
-    if (socket.readyState !== WebSocket.CLOSED) socket.terminate()
-    await closed
-  })
-  await once(socket, 'open')
-  const ready = once(socket, 'message')
-  socket.send(JSON.stringify({ type: 'open', streamId: 'desktop', endpoint: 'fixture/follow', payload: { args: { label: 'desktop' } } }))
-  await ready
+  const carrier = await openMuxCarrier(`${origin}/api/remote.mux`, { cookie: `dsh-desktop-session=${value}` })
+  const closed = new Promise<void>((resolve) => { carrier.onClose(() => { resolve() }) })
+  onTestFinished(async () => { await carrier.close() })
+  const ready = new Promise<string>((resolve) => { carrier.onFrame((frame) => { resolve(frame) }) })
+  carrier.send([JSON.stringify({ type: 'open', streamId: 'desktop', endpoint: 'fixture/follow', payload: { args: { label: 'desktop' } } })])
+  expect(JSON.parse(await ready) as { streamId: string; type: string }).toMatchObject({ streamId: 'desktop', type: 'item' })
   expect(ctx.operatorConnectFixture.calls.get('desktop')?.peer).toBe(desktopPeer)
   await desktop.dispose()
   await closed

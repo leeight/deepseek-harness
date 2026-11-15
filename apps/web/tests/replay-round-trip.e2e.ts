@@ -10,13 +10,13 @@ import { executeToolFixture } from '@deepseek-ai/dsh-tool-testkit'
 // Record: DSH_SNAPSHOT=record writes the current Session generation, then a keyless
 // DSH_SNAPSHOT=refresh regenerates ui.expected.md.
 // Suite setup (beforeAll, not per step): one fixed page clock
-// (page.clock.setFixedTime) and one routed Remote mux socket
-// (page.routeWebSocket) serve every step below, so the reconnect checkpoints
-// rely on both without re-pinning or re-routing them.
+// (page.clock.setFixedTime) and one in-page Remote mux probe
+// (installMuxProbe) serve every step below, so the reconnect checkpoints
+// rely on both without re-pinning or re-wrapping them.
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { Browser, Page, Route, WebSocketRoute } from 'playwright'
+import type { Browser, Page, Route } from 'playwright'
 import { chromium } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
 import { type ToolCallId, expandAssistantStream } from '@deepseek-ai/dsh-llm'
@@ -31,6 +31,7 @@ import {
 import {
   connectFreshWorkspace, expandTurnProcesses, newEnglishPage, REPO_ROOT, saveFailureShot,
 } from './support.ts'
+import { installMuxProbe, type MuxProbe } from './mux.ts'
 import { brandString } from '@deepseek-ai/dsh-brand'
 
 const SNAPSHOT_DIR = fileURLToPath(new URL('../../../snapshots/web/fresh-round-trip', import.meta.url))
@@ -64,7 +65,7 @@ describe('web e2e: fresh round trip through the real assembly', () => {
   let page: Page
   let tripwire: ReturnType<typeof watchConsole>
   let settledSessionId: SessionId | undefined
-  let remoteSocket: WebSocketRoute | undefined
+  let mux: MuxProbe
   const sessionEvents: SessionEvent[] = []
   const browserNow = Date.now()
 
@@ -77,10 +78,7 @@ describe('web e2e: fresh round trip through the real assembly', () => {
     browser = await chromium.launch()
     page = await newEnglishPage(browser)
     await page.clock.setFixedTime(browserNow)
-    await page.routeWebSocket('**/api/remote.mux', (route) => {
-      remoteSocket = route
-      route.connectToServer()
-    })
+    mux = await installMuxProbe(page)
     tripwire = watchConsole(page)
     await page.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
     await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
@@ -168,8 +166,8 @@ describe('web e2e: fresh round trip through the real assembly', () => {
       await expect.poll(() => row.getAttribute('draggable'), { timeout: 5_000 }).toBe('true')
       expect(sessionEvents.some(event => event.type === 'turn/start')).toBe(false)
 
-      const disconnected = remoteSocket
-      if (disconnected === undefined) throw new Error('the Web Remote socket never connected')
+      const connectedCarriers = await mux.connections()
+      if (connectedCarriers === 0) throw new Error('the Web Remote mux never connected')
       const warningStart = tripwire.warnings.length
       // Only this list response carries the 2d timestamp. Its rendered label
       // confirms the refresh reached the row, without altering blank/running.
@@ -194,9 +192,9 @@ describe('web e2e: fresh round trip through the real assembly', () => {
       await page.route(listUrl, markListResponse, { times: 1 })
       try {
         const refreshing = page.waitForResponse(listUrl)
-        const [, refreshed] = await Promise.all([disconnected.close(), refreshing])
+        const [, refreshed] = await Promise.all([mux.kill(), refreshing])
         // Cross-network reconnect: allow more than expect.poll's default.
-        await expect.poll(() => remoteSocket !== disconnected, { timeout: 15_000 }).toBe(true)
+        await expect.poll(() => mux.connections(), { timeout: 15_000 }).toBeGreaterThan(connectedCarriers)
         const baseline = await refreshed.json() as SessionListResponse
         expect(baseline.result.ok).toBe(true)
         if (!baseline.result.ok) throw new Error('the reconnect list request failed')

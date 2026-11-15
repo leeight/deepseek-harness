@@ -2,7 +2,6 @@ import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { queryObjects } from 'node:v8'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import WebSocket, { type RawData } from 'ws'
 import { Context, symbols } from '@deepseek-ai/cordis'
 import { apply as applyConnection, inject as connectionInject } from '@deepseek-ai/dsh-client-connection'
 import WebServer from '@deepseek-ai/dsh-host-webserver'
@@ -42,6 +41,7 @@ import type {
   RemoteEventClientId,
   RemoteEventInvocationFrame,
 } from '../src/stream-protocol.ts'
+import { MuxSocket } from './mux-socket.ts'
 import { ownerPeer, peerFor } from './peer.ts'
 
 vi.mock('node:crypto', async (importOriginal) => {
@@ -343,7 +343,7 @@ afterEach(async () => {
 })
 
 describe('Typert Remote streams', () => {
-  it('reports Client event streams without counting a bare WebSocket', async () => {
+  it('reports Client event streams without counting a bare mux session', async () => {
     const { ctx } = await setup(true)
     const source = new RemoteEventSourceProbe()
     const unregister = ctx.effect(() => ctx.typertGateway.registerRemoteEvents(source.source, REMOTE_HOST))
@@ -392,7 +392,7 @@ describe('Typert Remote streams', () => {
     }
   })
 
-  it.each([false, true])('accepts WebSockets only after application readiness (already ready: %s)', async (alreadyReady) => {
+  it.each([false, true])('accepts mux sessions only after application readiness (already ready: %s)', async (alreadyReady) => {
     const startup = new StartupProbe()
     if (alreadyReady) startup.commit()
     const { ctx } = await setup(true, {}, startup)
@@ -405,7 +405,7 @@ describe('Typert Remote streams', () => {
     expect(startup.pending).toBe(0)
   })
 
-  it('withdraws a pending WebSocket startup subscription when the Gateway unloads', async () => {
+  it('withdraws a pending mux startup subscription when the Gateway unloads', async () => {
     const startup = new StartupProbe()
     const { ctx } = await setup(true, {}, startup)
     expect(startup.pending).toBe(1)
@@ -416,50 +416,24 @@ describe('Typert Remote streams', () => {
     expect(() => { startup.commit() }).not.toThrow()
   })
 
-  it('validates the WebSocket heartbeat timer range, the stream inbox bound, and the compression mode', () => {
+  it('validates the stream heartbeat timer range and the stream inbox bound', () => {
     expect(TypertGatewayService.Config({})).toEqual({
-      websocketHeartbeatIntervalMs: 2_000,
+      streamHeartbeatIntervalMs: 2_000,
       streamInboxBytes: 262_144,
-      websocketCompression: 'deflate',
     })
     expect(TypertGatewayService.Config({
-      websocketHeartbeatIntervalMs: MAX_TIMER_DELAY_MS,
+      streamHeartbeatIntervalMs: MAX_TIMER_DELAY_MS,
       streamInboxBytes: 1,
-      websocketCompression: 'none',
     })).toEqual({
-      websocketHeartbeatIntervalMs: MAX_TIMER_DELAY_MS,
+      streamHeartbeatIntervalMs: MAX_TIMER_DELAY_MS,
       streamInboxBytes: 1,
-      websocketCompression: 'none',
     })
-    for (const websocketHeartbeatIntervalMs of [0, 1.5, MAX_TIMER_DELAY_MS + 1]) {
-      expect(() => TypertGatewayService.Config({ websocketHeartbeatIntervalMs })).toThrow()
+    for (const streamHeartbeatIntervalMs of [0, 1.5, MAX_TIMER_DELAY_MS + 1]) {
+      expect(() => TypertGatewayService.Config({ streamHeartbeatIntervalMs })).toThrow()
     }
     for (const streamInboxBytes of [0, 1.5]) {
       expect(() => TypertGatewayService.Config({ streamInboxBytes })).toThrow()
     }
-    for (const websocketCompression of ['gzip', 'DEFLATE', '', 1]) {
-      expect(() => TypertGatewayService.Config({ websocketCompression } as never)).toThrow()
-    }
-  })
-
-  it('applies the configured compression mode to the Remote stream carrier', async () => {
-    const { ctx } = await setup(true)
-    const negotiating = new WebSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`, {
-      headers: { cookie: await browserCookie(ctx) },
-    })
-    await once(negotiating, 'open')
-    expect(negotiating.extensions).toContain('permessage-deflate')
-    negotiating.close()
-    await once(negotiating, 'close')
-
-    const plain = await setup(true, { websocketCompression: 'none' })
-    const unnegotiated = new WebSocket(`ws://127.0.0.1:${String(plain.ctx.webServer.port)}/api/remote.mux`, {
-      headers: { cookie: await browserCookie(plain.ctx) },
-    })
-    await once(unnegotiated, 'open')
-    expect(unnegotiated.extensions).toBe('')
-    unnegotiated.close()
-    await once(unnegotiated, 'close')
   })
 
   it('opens decoded carrier payloads through the in-process wire adapter', async () => {
@@ -825,7 +799,7 @@ describe('Typert Remote streams', () => {
 
   it('reports configured frame capacity and the encoded envelope size for the current stream id', async () => {
     const { ctx, service } = await setup(true, { streamInboxBytes: 512 })
-    const socket = new WebSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`, { headers: { cookie: await browserCookie(ctx) } })
+    const socket = new MuxSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`, { headers: { cookie: await browserCookie(ctx) } })
     await once(socket, 'open')
     try {
       const streamId = '界"window'
@@ -843,14 +817,14 @@ describe('Typert Remote streams', () => {
     }
   })
 
-  it('echoes uplink frames over the WebSocket carrier and fails misused uplinks per stream', async () => {
+  it('echoes uplink frames over the HTTP carrier and fails misused uplinks per stream', async () => {
     const { ctx, service } = await setup(true)
-    const socket = new WebSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`, {
+    const socket = new MuxSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`, {
       headers: { cookie: await browserCookie(ctx) },
     })
     await once(socket, 'open')
     const frames: Record<string, unknown>[] = []
-    socket.on('message', (data) => { frames.push(JSON.parse(rawText(data)) as Record<string, unknown>) })
+    socket.on('message', (data: string) => { frames.push(JSON.parse(data) as Record<string, unknown>) })
 
     sendOpen(socket, 'echo', 'feed/echo', { prefix: '> ' })
     socket.send(JSON.stringify({ type: 'item', streamId: 'echo', value: 'a' }))
@@ -893,19 +867,19 @@ describe('Typert Remote streams', () => {
         error: { code: 'gateway/protocol', details: { endpoint: 'feed/hold' } },
       })
     })
-    expect(socket.readyState).toBe(WebSocket.OPEN)
+    expect(socket.readyState).toBe(MuxSocket.OPEN)
     socket.close()
     await once(socket, 'close')
   })
 
   it('fails a stream whose buffered uplink exceeds the configured inbox bytes', async () => {
     const { ctx } = await setup(true, { streamInboxBytes: 64 })
-    const socket = new WebSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`, {
+    const socket = new MuxSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`, {
       headers: { cookie: await browserCookie(ctx) },
     })
     await once(socket, 'open')
     const frames: Record<string, unknown>[] = []
-    socket.on('message', (data) => { frames.push(JSON.parse(rawText(data)) as Record<string, unknown>) })
+    socket.on('message', (data: string) => { frames.push(JSON.parse(data) as Record<string, unknown>) })
 
     sendOpen(socket, 'big', 'feed/hold', {})
     await vi.waitFor(() => { expect(frames).toContainEqual({ type: 'item', streamId: 'big', value: 'held' }) })
@@ -989,27 +963,28 @@ describe('Typert Remote streams', () => {
     })).rejects.toMatchObject({ code: 'gateway/signature-invalid' } satisfies Partial<TypertGatewayError>)
   })
 
-  it('uses the configured WebSocket heartbeat interval', { timeout: 1_000 }, async () => {
-    const { ctx } = await setup(true, { websocketHeartbeatIntervalMs: 20 })
-    const socket = new WebSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`, {
+  it('sends liveness frames on the configured stream heartbeat interval', { timeout: 1_000 }, async () => {
+    const { ctx } = await setup(true, { streamHeartbeatIntervalMs: 20 })
+    const socket = new MuxSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`, {
       headers: { cookie: await browserCookie(ctx) },
     })
     const ping = once(socket, 'ping')
     await once(socket, 'open')
-    expect((await ping)[0]).toEqual(Buffer.alloc(0))
+    // The fixture raises `ping` only for a `{"type":"ping"}` downlink frame.
+    await ping
 
     socket.close()
     await once(socket, 'close')
   })
 
-  it('multiplexes independent streams over one WebSocket and propagates cancellation', async () => {
+  it('multiplexes independent streams over one mux session and propagates cancellation', async () => {
     const { ctx, service } = await setup(true)
-    const socket = new WebSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`, {
+    const socket = new MuxSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`, {
       headers: { cookie: await browserCookie(ctx) },
     })
     await once(socket, 'open')
     const frames: Record<string, unknown>[] = []
-    socket.on('message', (data) => { frames.push(JSON.parse(rawText(data)) as Record<string, unknown>) })
+    socket.on('message', (data: string) => { frames.push(JSON.parse(data) as Record<string, unknown>) })
 
     sendOpen(socket, 'a', 'feed/follow', { label: 'a' })
     sendOpen(socket, 'b', 'feed/follow', { label: 'b' })
@@ -1055,11 +1030,14 @@ describe('Typert Remote streams', () => {
       })
     })
 
-    const closed = once(socket, 'close')
+    // A failure that cannot be written leaves the session ambiguous, so the Host
+    // destroys the downlink; the fixture client reports that as an abnormal close.
+    const closed = new Promise<number>((resolve) => {
+      socket.once('close', (code: number) => { resolve(code) })
+    })
+    socket.on('error', () => {})
     sendOpen(socket, 'broken-error', 'feed/rejectWithNonJsonDetails', {})
-    const closeEvent = await closed
-    expect(closeEvent[0]).toBe(1011)
-    expect(String(closeEvent[1])).toBe('Remote stream failure could not be delivered')
+    expect(await closed).toBe(1006)
     await vi.waitFor(() => { expect(service.returns).toBe(2) })
     expect(service.signals[1]?.aborted).toBe(true)
   })
@@ -1083,18 +1061,18 @@ describe('Typert Remote streams', () => {
     await vi.waitFor(() => { expect(returned).toHaveBeenCalledOnce() })
     await events[Symbol.asyncIterator]().return?.()
 
-    const socket = new WebSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`, {
+    const socket = new MuxSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`, {
       headers: { cookie: await browserCookie(ctx) },
     })
     await once(socket, 'open')
     const frames: Record<string, unknown>[] = []
-    socket.on('message', (data) => { frames.push(JSON.parse(rawText(data)) as Record<string, unknown>) })
+    socket.on('message', (data: string) => { frames.push(JSON.parse(data) as Record<string, unknown>) })
     sendOpen(socket, 'events', '$events', {})
     await vi.waitFor(() => { expect(frames.filter(frame => frame.streamId === 'events')).toHaveLength(1) })
     for (let index = 0; index < 4; index += 1) {
       socket.send(JSON.stringify({ type: 'item', streamId: 'events', value: 'x'.repeat(40) }))
     }
-    // A Remote stream opened afterwards on the same socket shows the flood was processed and harmed nothing.
+    // A Remote stream opened afterwards on the same mux session shows the flood was processed and harmed nothing.
     sendOpen(socket, 'after', 'feed/sync', { label: 'after' })
     await vi.waitFor(() => { expect(frames).toContainEqual({ type: 'end', streamId: 'after' }) })
     expect(frames.filter(frame => frame.streamId === 'events').map(frame => frame.type)).toEqual(['item'])
@@ -1126,12 +1104,12 @@ describe('Typert Remote streams', () => {
     expect(() => { ctx.typertGateway.registerRemoteEvents(source, REMOTE_HOST) })
       .toThrow('forwarded Remote event source is already registered')
 
-    const socket = new WebSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`, {
+    const socket = new MuxSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`, {
       headers: { cookie: await browserCookie(ctx) },
     })
     await once(socket, 'open')
     const frames: Record<string, unknown>[] = []
-    socket.on('message', (data) => { frames.push(JSON.parse(rawText(data)) as Record<string, unknown>) })
+    socket.on('message', (data: string) => { frames.push(JSON.parse(data) as Record<string, unknown>) })
     sendOpen(socket, 'events', '$events', {})
 
     await vi.waitFor(() => {
@@ -1340,15 +1318,20 @@ describe('Typert Remote streams', () => {
     const unregister = ctx.effect(() => ctx.typertGateway.registerRemoteEvents(source.source, REMOTE_HOST))
     const firstId = '00000000-0000-4000-8000-000000000011' as ReturnType<typeof randomUUID>
     const secondId = '00000000-0000-4000-8000-000000000012' as ReturnType<typeof randomUUID>
-    randomUuid.mockReturnValueOnce(firstId).mockReturnValueOnce(firstId).mockReturnValueOnce(secondId)
+    const firstSession = '00000000-0000-4000-8000-000000000021' as ReturnType<typeof randomUUID>
+    const secondSession = '00000000-0000-4000-8000-000000000022' as ReturnType<typeof randomUUID>
+    // Each downlink names its mux session before the $events open asks for a Client id.
+    randomUuid
+      .mockReturnValueOnce(firstSession).mockReturnValueOnce(firstId)
+      .mockReturnValueOnce(secondSession).mockReturnValueOnce(firstId).mockReturnValueOnce(secondId)
 
     try {
       const first = await openEventClient(ctx, 'events-client-id-a')
       expect(first.clientId).toBe(firstId)
-      expect(randomUuid).toHaveBeenCalledTimes(1)
+      expect(randomUuid).toHaveBeenCalledTimes(2)
       const second = await openEventClient(ctx, 'events-client-id-b')
       expect(second.clientId).toBe(secondId)
-      expect(randomUuid).toHaveBeenCalledTimes(3)
+      expect(randomUuid).toHaveBeenCalledTimes(5)
 
       const notification = { event: 'fixture/changed', args: ['both clients'] }
       source.push(notification)
@@ -1595,12 +1578,12 @@ describe('Typert Remote streams', () => {
 
   it('validates the internal Remote event request and reports an absent source', async () => {
     const { ctx } = await setup(true)
-    const socket = new WebSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`, {
+    const socket = new MuxSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`, {
       headers: { cookie: await browserCookie(ctx) },
     })
     await once(socket, 'open')
     const frames: Record<string, unknown>[] = []
-    socket.on('message', (data) => { frames.push(JSON.parse(rawText(data)) as Record<string, unknown>) })
+    socket.on('message', (data: string) => { frames.push(JSON.parse(data) as Record<string, unknown>) })
 
     sendOpen(socket, 'missing', '$events', {})
     await vi.waitFor(() => {
@@ -1641,11 +1624,13 @@ describe('Typert Remote streams', () => {
     socket.close()
   })
 
-  it('applies Connection trusted-host policy before accepting the Gateway socket', async () => {
+  it('applies Connection request-source policy before accepting the mux downlink', async () => {
     const { ctx } = await setup(true)
-    const socket = new WebSocket(
+    // A fetch owns the Host header, so the fixture exercises the Origin fence of
+    // the same policy: a foreign request source is refused before authentication.
+    const socket = new MuxSocket(
       `ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`,
-      { headers: { host: 'untrusted.example' } },
+      { headers: { cookie: await browserCookie(ctx), origin: 'http://untrusted.example' } },
     )
     socket.on('error', () => {})
     const responseEvent: unknown[] = await once(socket, 'unexpected-response')
@@ -1659,7 +1644,7 @@ describe('Typert Remote streams', () => {
 
   it('answers an unauthenticated trusted Host with 401 before opening a stream', async () => {
     const { ctx } = await setup(true)
-    const socket = new WebSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`)
+    const socket = new MuxSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`)
     socket.on('error', () => {})
     const responseEvent: unknown[] = await once(socket, 'unexpected-response')
     const request = responseEvent[0]
@@ -1702,7 +1687,7 @@ async function setup(
 }
 
 async function acceptsSocket(ctx: Context): Promise<boolean> {
-  const socket = new WebSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`, {
+  const socket = new MuxSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`, {
     headers: { cookie: await browserCookie(ctx) },
   })
   const closed = new Promise<void>((resolve) => { socket.once('close', () => { resolve() }) })
@@ -1775,7 +1760,7 @@ function descriptors(): InvocationDescriptor[] {
 }
 
 interface RemoteEventTestClient {
-  readonly socket: WebSocket
+  readonly socket: MuxSocket
   readonly frames: Record<string, unknown>[]
   readonly streamId: string
   readonly clientId: RemoteEventClientId
@@ -1786,12 +1771,12 @@ interface RemoteEventTestClient {
 async function openEventClient(ctx: Context, streamId: string): Promise<RemoteEventTestClient> {
   const origin = `http://127.0.0.1:${String(ctx.webServer.port)}`
   const cookie = await browserCookie(ctx)
-  const socket = new WebSocket(`${origin.replace('http:', 'ws:')}/api/remote.mux`, {
+  const socket = new MuxSocket(`${origin.replace('http:', 'ws:')}/api/remote.mux`, {
     headers: { cookie },
   })
   await once(socket, 'open')
   const frames: Record<string, unknown>[] = []
-  socket.on('message', (data) => { frames.push(JSON.parse(rawText(data)) as Record<string, unknown>) })
+  socket.on('message', (data: string) => { frames.push(JSON.parse(data) as Record<string, unknown>) })
   sendOpen(socket, streamId, '$events', {})
   let clientId: RemoteEventClientId | undefined
   await vi.waitFor(() => {
@@ -1854,14 +1839,8 @@ async function sendEventResult(
   }
 }
 
-function sendOpen(socket: WebSocket, streamId: string, endpoint: string, args: object): void {
+function sendOpen(socket: MuxSocket, streamId: string, endpoint: string, args: object): void {
   socket.send(JSON.stringify({ type: 'open', streamId, endpoint, payload: { args } }))
-}
-
-function rawText(data: RawData): string {
-  if (Array.isArray(data)) return Buffer.concat(data).toString('utf8')
-  if (data instanceof ArrayBuffer) return Buffer.from(data).toString('utf8')
-  return Buffer.from(data).toString('utf8')
 }
 
 function streamErrorMessage(frames: readonly Record<string, unknown>[], streamId: string): string | undefined {

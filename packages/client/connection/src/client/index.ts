@@ -13,10 +13,11 @@ import { isLoopbackHostname } from '../loopback-hostname.ts'
 import type { ClientConnectionRpc } from '../rpc.ts'
 import { resolveConnectionConfig } from '../recovery-config.ts'
 import type { ConnectionInteractions } from '../connect-protocol.ts'
-import { openConnectionWebSocket, type ConnectionWebSocket, type ConnectionWebSocketFactory } from './socket.ts'
+import { openHttpStreamMux, type ConnectionMuxCarrier, type ConnectionMuxRequest } from './mux.ts'
 
 export type { ConnectionInteractions } from '../connect-protocol.ts'
-export type { ConnectionWebSocket, ConnectionWebSocketFactory } from './socket.ts'
+export type { ConnectionMuxCarrier, ConnectionMuxRequest, ConnectionMuxSession } from './mux.ts'
+export { MUX_CLOSED, MUX_CONNECTING, MUX_OPEN } from './mux.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Events {
@@ -77,9 +78,9 @@ export const inject: string[] = []
 
 /**
  * Physical carrier selected when the Connection service is installed. The
- * served web app omits it and gets HTTP + WebSocket; a shell that owns a
- * different transport (the worker preview's postMessage tunnel) provides both
- * halves instead of forking this plugin.
+ * served web app omits it and gets the HTTP mux; a shell that owns a different
+ * transport (the worker preview's postMessage tunnel) provides both halves
+ * instead of forking this plugin.
  */
 export interface ClientTransportHooks {
   /**
@@ -90,7 +91,7 @@ export interface ClientTransportHooks {
   rpc?: ClientConnectionRpc
   /** Transport for generic unary RPC channels (the Typert gateway); unused when `rpc` is present. */
   fetch?: RpcFetch
-  /** Worker-local Gateway stream carrier; absent when the page uses the Gateway WebSocket or `rpc` is present. */
+  /** Worker-local Gateway stream carrier; absent when the page uses the HTTP mux or `rpc` is present. */
   openStream?: RpcStreamOpen
   /**
    * Bundle transport for the module system, present when the carrier also owns
@@ -113,9 +114,7 @@ export interface ClientTransportHooks {
    * transport can set this; served pages never carry the global at all.
    */
   ownsHost?: boolean
-  /** Authenticated WebSocket factory; omission uses the browser API and its cookie jar. */
-  createWebSocket?: ConnectionWebSocketFactory
-  /** Host base URL for desktop or Node sockets; omission uses the document base. */
+  /** Host base URL for page-owned and Node transports; omission uses the document base. */
   streamBaseUrl?: string
 }
 
@@ -134,7 +133,7 @@ export interface ConnectionLocation {
 export interface ConnectionInstallOptions {
   /** Forwarded-event participation; omission selects answer for a page and none otherwise. */
   readonly interactions?: ConnectionInteractions
-  /** Explicit physical carrier; omit for the browser HTTP + WebSocket carrier. */
+  /** Explicit physical carrier; omit for the browser's HTTP carrier. */
   readonly transport?: ClientTransportHooks
   /** Reconnect timing overrides; omitted fields use controller defaults. */
   readonly recovery?: ConnectionRecoveryConfig
@@ -162,11 +161,11 @@ export interface ConnectionHandle {
   /** Generic logical RPC channels over the same Connection transport. */
   readonly rpc: ClientConnectionRpc
   /**
-   * Create a socket on the selected carrier; the channel owns framing and closing.
-   * @param path - absolute logical channel path, resolved beneath the Host mount.
-   * @returns a newly connecting socket using the installed authentication factory.
+   * Start one duplex carrier on the selected transport; the channel owns framing and closing.
+   * @param request - absolute logical channel path, its session field names, and an optional base URL.
+   * @returns a newly connecting carrier that emits `open`, `message`, `error`, and `close`.
    */
-  openWebSocket(path: string): ConnectionWebSocket
+  openStreamMux(request: ConnectionMuxRequest): ConnectionMuxCarrier
   /** Reset retry progression and replace the current attempt immediately. */
   reconnect(): void
   /**
@@ -270,7 +269,11 @@ export function installConnection(ctx: Context, options: ConnectionInstallOption
   }
   const handle: ConnectionHandle = {
     interactions,
-    openWebSocket: path => openConnectionWebSocket(path, transport?.createWebSocket, transport?.streamBaseUrl),
+    openStreamMux: request => openHttpStreamMux({
+      ...request,
+      fetch: request.fetch ?? transport?.fetch,
+      baseUrl: request.baseUrl ?? transport?.streamBaseUrl,
+    }),
     isLoopback: transport?.ownsHost === true || pageLocation === undefined || isLoopbackHostname(pageLocation.hostname),
     generation: {
       getSnapshot: () => generation,

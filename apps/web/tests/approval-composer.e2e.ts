@@ -6,8 +6,6 @@ import { join } from 'node:path'
 import type { Browser, Page } from 'playwright'
 import { chromium } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed, onTestFinished } from 'vitest'
-import { once } from 'node:events'
-import WebSocket from 'ws'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 // Empty type import: carries the approval package's session-event merge, so
 // the decided-outcome assertion below type-checks against the real union.
@@ -16,6 +14,7 @@ import {
   assertFinalWorkspaceSnapshot, assertFixtureInventory, captureStableAria, compareOrRefreshGolden, fixtureUserPrompts,
   launchWebScaffold, recordFixture, watchConsole, webSnapshotMode, type WebScaffold,
 } from './scaffold.ts'
+import { openMuxCarrier } from './mux.ts'
 import { connectFreshWorkspace, newEnglishPage, saveFailureShot } from './support.ts'
 
 const SNAPSHOT_DIR = fileURLToPath(new URL('../../../snapshots/web/approval-composer', import.meta.url))
@@ -83,24 +82,18 @@ describe.each(MODE === 'record' ? ['button'] as const : ['button', 'keyboard'] a
     expect(connected.status).toBe(302)
     const cookie = connected.headers.get('set-cookie')!.split(';', 1)[0]!
     const muxUrl = new URL(connected.headers.get('location')!, connectUrl)
-    muxUrl.protocol = muxUrl.protocol === 'https:' ? 'wss:' : 'ws:'
-    const passive = new WebSocket(muxUrl, { headers: { cookie } })
-    const passiveClosed = new Promise<void>((resolve) => { passive.once('close', resolve) })
-    passive.on('error', () => { /* The open/message waits below report carrier errors. */ })
-    onTestFinished(async () => { passive.terminate(); await passiveClosed })
-    const passiveFrames: string[] = []
+    const passive = await openMuxCarrier(muxUrl.href, { cookie })
+    onTestFinished(async () => { await passive.close() })
     const refused = Promise.withResolvers<string>()
-    passive.on('message', (data) => {
-      const bytes = Array.isArray(data) ? Buffer.concat(data)
-        : Buffer.from(data instanceof ArrayBuffer ? new Uint8Array(data) : data)
-      const text = bytes.toString('utf8')
+    const passiveFrames: string[] = []
+    passive.onFrame((text) => {
       passiveFrames.push(text)
       refused.resolve(text)
     })
-    await once(passive, 'open')
-    passive.once('error', (error) => { refused.reject(error) })
-    passive.send(JSON.stringify({ type: 'open', streamId: 'passive-events', endpoint: '$events', payload: { args: {} } }))
-    expect(JSON.parse(await refused.promise)).toMatchObject({
+    passive.onError((error) => { refused.reject(error) })
+    passive.onClose(() => { refused.reject(new Error('the passive carrier closed before its refusal frame')) })
+    passive.send([JSON.stringify({ type: 'open', streamId: 'passive-events', endpoint: '$events', payload: { args: {} } })])
+    expect(JSON.parse(await refused.promise) as { type: string; streamId: string; error: { code: string } }).toMatchObject({
       type: 'error', streamId: 'passive-events', error: { code: 'gateway/interactions-forbidden' },
     })
 

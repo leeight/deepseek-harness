@@ -1,4 +1,4 @@
-/** External authentication providers use existing Peer scopes over real HTTP and WebSocket. */
+/** External authentication providers use existing Peer scopes over real HTTP and the Remote stream mux. */
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
@@ -16,17 +16,17 @@ import TypertGateway from '@deepseek-ai/dsh-api-gateway'
 import RemoteAccess from '@deepseek-ai/dsh-api-remote-access'
 import type { PeerScope } from '@deepseek-ai/dsh-typert-protocol'
 import { expect, it, onTestFinished, vi } from 'vitest'
-import WebSocket from 'ws'
 import { parseRemoteStreamServerMessage, type RemoteStreamServerMessage } from '../src/stream-protocol.ts'
+import { MuxSocket } from './mux-socket.ts'
 import OperatorConnectFixture from './operator-connect-fixture.ts'
 
 it('uses the provider-owned Peer for HTTP and streams, then closes only its scope on unload', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-provider-transport-'))
   const ctx = new Context()
-  const clients: { socket: WebSocket; closed: Promise<void>; errors: Error[] }[] = []
+  const clients: { label: string; socket: MuxSocket; closed: Promise<void>; errors: Error[] }[] = []
   onTestFinished(async () => {
     await Promise.all(clients.map(async ({ socket, closed }) => {
-      if (socket.readyState !== WebSocket.CLOSED) socket.terminate()
+      if (socket.readyState !== MuxSocket.CLOSED) socket.terminate()
       await closed
     }))
     await ctx.fiber.dispose()
@@ -89,18 +89,14 @@ it('uses the provider-owned Peer for HTTP and streams, then closes only its scop
     await response.text()
     return response.status
   }
-  const follow = async (cookie: string, label: string): Promise<WebSocket> => {
-    const socket = new WebSocket(`${origin.replace('http:', 'ws:')}/api/remote.mux`, { headers: { cookie } })
+  const follow = async (cookie: string, label: string): Promise<MuxSocket> => {
+    const socket = new MuxSocket(`${origin}/api/remote.mux`, { headers: { cookie } })
     const closed = new Promise<void>((done) => { socket.once('close', () => { done() }) })
     const errors: Error[] = []
     const frames: RemoteStreamServerMessage[] = []
-    clients.push({ socket, closed, errors })
-    socket.on('error', error => errors.push(error))
-    socket.on('message', (data) => {
-      const text = Array.isArray(data) ? Buffer.concat(data).toString('utf8')
-        : Buffer.from(data instanceof ArrayBuffer ? new Uint8Array(data) : data).toString('utf8')
-      frames.push(parseRemoteStreamServerMessage(text))
-    })
+    clients.push({ label, socket, closed, errors })
+    socket.on('error', (error: Error) => errors.push(error))
+    socket.on('message', (text: string) => { frames.push(parseRemoteStreamServerMessage(text)) })
     await once(socket, 'open')
     socket.send(JSON.stringify({ type: 'open', streamId: label, endpoint: 'fixture/follow', payload: { args: { label } } }))
     await vi.waitFor(() => {
@@ -122,13 +118,16 @@ it('uses the provider-owned Peer for HTTP and streams, then closes only its scop
   const entry = [...ctx.loader.entries()].find(item => item.options.id === 'provider-a')
   if (entry?.fiber === undefined) throw new Error('provider fixture did not activate')
   await entry.fiber.dispose()
-  await vi.waitFor(() => { expect(socketA.readyState).toBe(WebSocket.CLOSED) })
+  await vi.waitFor(() => { expect(socketA.readyState).toBe(MuxSocket.CLOSED) })
   expect(peerA?.signal.aborted).toBe(true)
   expect(peerB?.signal.aborted).toBe(false)
-  expect(socketB.readyState).toBe(WebSocket.OPEN)
+  expect(socketB.readyState).toBe(MuxSocket.OPEN)
   await vi.waitFor(() => { expect(fixture.calls.get('stream-a')?.finished).toBe(true) })
   expect(await identity('provider-a=valid', 'after-a')).toBe(401)
   expect(await identity('provider-b=valid', 'after-b')).toBe(200)
   expect(fixture.calls.get('after-b')?.peer).toBe(peerB)
-  for (const client of clients) expect(client.errors).toEqual([])
+  // Disposing the provider destroys its response socket, which the carrier reports as a
+  // transport failure; the surviving provider's downlink stays clean.
+  expect(clients.find(client => client.label === 'stream-a')?.errors).toHaveLength(1)
+  expect(clients.find(client => client.label === 'stream-b')?.errors).toEqual([])
 })

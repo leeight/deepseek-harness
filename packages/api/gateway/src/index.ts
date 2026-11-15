@@ -1,7 +1,7 @@
 /**
  * Live Typert Remote dispatch over Cordis Services and registered providers.
  * Unary transport and response envelopes belong to Connection; live Remote
- * streams use the Gateway-owned WebSocket mux.
+ * streams use the Gateway-owned HTTP mux.
  * @module @deepseek-ai/dsh-api-gateway
  */
 
@@ -14,7 +14,7 @@ import type {
 import type { RemoteAccessDecision } from '@deepseek-ai/dsh-api-remote-access'
 import { callResources, eventResources } from './access.ts'
 import { Deque } from '@deepseek-ai/dsh-deque'
-import type { WebUpgradeRoute } from '@deepseek-ai/dsh-host-webserver'
+import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import type {} from '@deepseek-ai/dsh-cmdline'
 import z from '@deepseek-ai/schemastery'
@@ -145,7 +145,7 @@ interface PendingRemoteEvent {
 type ConnectionRpcResult = Awaited<ReturnType<ConnectionRpcHandler>>
 type ConnectionRpcError = Extract<ConnectionRpcResult, { readonly ok: false }>['error']
 const NEVER_ABORTED_SIGNAL = new AbortController().signal
-const DEFAULT_WEBSOCKET_HEARTBEAT_INTERVAL_MS = 2_000
+const DEFAULT_STREAM_HEARTBEAT_INTERVAL_MS = 2_000
 const DEFAULT_STREAM_INBOX_BYTES = 262_144
 const EMPTY_ASYNC_ITERABLE: AsyncIterable<never> = {
   [Symbol.asyncIterator]: () => ({ next: () => Promise.resolve({ value: undefined, done: true }) }),
@@ -155,18 +155,15 @@ const SRC_JSON_CODEC: TypertCodec = { mode: 'src-json' }
 
 /** Gateway transport configuration. */
 export interface Config {
-  /** WebSocket Ping interval from 1 through 2,147,483,647 milliseconds. @default 2000 */
-  readonly websocketHeartbeatIntervalMs?: number
+  /** Downlink liveness frame interval from 1 through 2,147,483,647 milliseconds. @default 2000 */
+  readonly streamHeartbeatIntervalMs?: number
   /** Buffered uplink frame bytes one logical stream may hold before it fails with `gateway/uplink-overflow`. @default 262144 */
   readonly streamInboxBytes?: number
-  /** Per-message compression for the Remote stream WebSocket; `'none'` disables the extension. @default 'deflate' */
-  readonly websocketCompression?: 'none' | 'deflate'
 }
 
 interface ResolvedConfig extends Config {
-  readonly websocketHeartbeatIntervalMs: number
+  readonly streamHeartbeatIntervalMs: number
   readonly streamInboxBytes: number
-  readonly websocketCompression: 'none' | 'deflate'
 }
 
 /**
@@ -213,13 +210,12 @@ export class TypertGatewayError extends RemoteError<TypertGatewayErrorCode> {
 export class TypertGatewayService extends Service implements TypertGateway {
   static inject = ['typert', 'remoteAccess']
   static Config: z<Config> = z.object({
-    websocketHeartbeatIntervalMs: z.number().step(1).min(1).max(MAX_TIMER_DELAY_MS)
-      .default(DEFAULT_WEBSOCKET_HEARTBEAT_INTERVAL_MS),
+    streamHeartbeatIntervalMs: z.number().step(1).min(1).max(MAX_TIMER_DELAY_MS)
+      .default(DEFAULT_STREAM_HEARTBEAT_INTERVAL_MS),
     streamInboxBytes: z.number().step(1).min(1).default(DEFAULT_STREAM_INBOX_BYTES),
-    websocketCompression: z.union([z.const('none'), z.const('deflate')]).default('deflate'),
   })
 
-  /** Carrier adapter shared by the WebSocket mux and local Host transports. */
+  /** Carrier adapter shared by the HTTP mux and local Host transports. */
   readonly wireStream: TypertGatewayWireStream = {
     open: (endpoint, payload, uplink, peer, signal) =>
       this.openWireStream(endpoint, payload, uplink, peer, signal, new AbortController()),
@@ -233,7 +229,7 @@ export class TypertGatewayService extends Service implements TypertGateway {
 
   /**
    * Register the Gateway against the active Typert registry.
-   * WebSocket admission waits for launcher-owned application readiness when supplied;
+   * Mux admission waits for launcher-owned application readiness when supplied;
    * direct invocation and in-process streams remain available independently.
    * @param ctx - owning Host Context with Typert registry access.
    * @param config - validated Gateway transport configuration.
@@ -258,24 +254,16 @@ export class TypertGatewayService extends Service implements TypertGateway {
             this.openWireStream(endpoint, payload, uplink, peer, control.signal, control, window),
           this.wireStream.failure,
           {
-            heartbeatIntervalMs: resolved.websocketHeartbeatIntervalMs,
+            heartbeatIntervalMs: resolved.streamHeartbeatIntervalMs,
             streamInboxBytes: resolved.streamInboxBytes,
-            compression: resolved.websocketCompression === 'deflate',
           },
         )
         webCtx.effect(function* () {
           yield async () => {
             await mux.close()
           }
-          const route: WebUpgradeRoute = {
-            path: REMOTE_STREAM_MUX_PATH,
-            auth: 'required',
-            handler: (req, socket, head, peer) => {
-              mux.handleUpgrade(req, socket, head, peer as PeerScope)
-            },
-          }
-          yield webCtx.webServer.registerUpgrade(route)
-        }, `api-gateway: ${REMOTE_STREAM_MUX_PATH} WebSocket`)
+          yield webCtx.webServer.register(muxRoute(mux))
+        }, `api-gateway: ${REMOTE_STREAM_MUX_PATH} stream mux`)
       }
       // Existing pages reconnect before the new Host prints its URL. No stream
       // may enter until the launcher has activated and audited its controllers.
@@ -1191,6 +1179,37 @@ class RemoteEventQueue {
     } finally {
       signal.removeEventListener('abort', abort)
     }
+  }
+}
+
+/**
+ * Route the one exact mux path: `GET` opens a downlink, `POST` delivers one
+ * uplink frame, and every other method is refused.
+ * @param mux - server owning the downlink sessions.
+ * @returns the exact route registration.
+ */
+function muxRoute(mux: RemoteStreamMuxServer): WebRoute {
+  return {
+    kind: 'exact',
+    path: REMOTE_STREAM_MUX_PATH,
+    auth: 'required',
+    handler: (req, res, peer) => {
+      /* v8 ignore next 4 -- `auth: 'required'` denies a request without a live Peer. */
+      if (peer === undefined) {
+        res.writeHead(403, { 'cache-control': 'no-store' }).end('forbidden')
+        return
+      }
+      if (req.method === 'GET') {
+        mux.handleDownlink(req, res, peer)
+        return
+      }
+      if (req.method === 'POST') {
+        void mux.handleUplink(req, res, peer)
+        return
+      }
+      res.writeHead(405, { allow: 'GET, POST', 'cache-control': 'no-store' })
+      res.end()
+    },
   }
 }
 
