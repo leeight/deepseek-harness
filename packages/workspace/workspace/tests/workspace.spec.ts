@@ -1,7 +1,7 @@
 import { brandString } from '@deepseek-ai/dsh-brand'
 import type { z } from 'zod'
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest'
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join, relative } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -751,6 +751,44 @@ describe('Workspace session ordering', () => {
     await expect(workspace.attachSession(brandString<SessionId>('file'))).rejects.toThrow(/not a directory/)
     await expect(workspace.attachSession(brandString<SessionId>('unknown'))).rejects.toThrow(/no such session/)
     expect(workspace.sessionIds).toEqual([])
+  })
+
+  it('adopts the canonical spelling when the workspace directory becomes a symlink', async () => {
+    const dir = await makeDir('relinked')
+    const target = join(base, 'relinked-target')
+    const initial = await harness({ sessions: [header('before', dir)] })
+    onTestFinished(() => initial.ctx.fiber.dispose())
+    const workspace = await initial.registry.create(dir)
+    await workspace.attachSession(brandString<SessionId>('before'))
+    await rename(dir, target)
+    await symlink(target, dir)
+
+    const restarted = await harness({ pool: initial.pool, sessions: [header('before', dir), header('after', dir)] })
+    onTestFinished(() => restarted.ctx.fiber.dispose())
+    const restored = restarted.registry.get(workspace.id)!
+    expect(restored.path).toBe(dir)
+
+    await restored.attachSession(brandString<SessionId>('after'))
+    expect(restored.path).toBe(target)
+    expect(restored.sessionIds).toEqual(['after', 'before'])
+    expect(storedRecord(initial.pool, workspace.id).path).toBe(target)
+  })
+
+  it('names the workspace path when the session cannot be validated against it', async () => {
+    const dir = await makeDir('vanished-ws')
+    const target = join(base, 'vanished-target')
+    const initial = await harness({ sessions: [header('kept', dir)] })
+    onTestFinished(() => initial.ctx.fiber.dispose())
+    const workspace = await initial.registry.create(dir)
+    await workspace.attachSession(brandString<SessionId>('kept'))
+    await rename(dir, target)
+
+    const restarted = await harness({ pool: initial.pool, sessions: [header('kept', dir), header('fresh', target)] })
+    onTestFinished(() => restarted.ctx.fiber.dispose())
+    const restored = restarted.registry.get(workspace.id)!
+    await expect(restored.attachSession(brandString<SessionId>('fresh')))
+      .rejects.toThrow(/the workspace path does not resolve/)
+    expect(storedRecord(initial.pool, workspace.id).path).toBe(dir)
   })
 
   it('decides detach/attach membership at domain write-chain slots', async () => {

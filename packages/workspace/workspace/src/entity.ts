@@ -112,6 +112,7 @@ export class WorkspaceEntity implements Workspace {
     // id: the cwd fact was checked when it first attached and both inputs
     // (stored header cwd, workspace path) are immutable. Membership itself is
     // decided on the write chain inside `mutate`, never on this snapshot.
+    let validatedPath = this.record.path
     if (!this.record.sessionIds.includes(sessionId)) {
       const header = await this.host.readSessionHeader(sessionId)
       if (header.cwd === undefined) {
@@ -136,17 +137,34 @@ export class WorkspaceEntity implements Workspace {
           + `its cwd '${header.cwd}' is not a directory`,
         )
       }
-      if (cwd !== this.record.path) {
+      // A stored path is canonical when written, but the directory can later
+      // become a symlink (the spelling keeps working through the link while its
+      // target is what every cwd canon resolves to). Validate through the same
+      // canon the Session facts use, then adopt the current spelling.
+      let workspacePath: string
+      try {
+        workspacePath = await realpathNormalize(this.record.path)
+      } catch (error) {
+        throw new Error(
+          `cannot attach session '${sessionId}' to workspace '${this.record.path}': `
+          + 'the workspace path does not resolve, so the session cannot be validated',
+          { cause: error },
+        )
+      }
+      if (cwd !== workspacePath) {
         throw new Error(
           `cannot attach session '${sessionId}' to workspace '${this.record.path}': `
           + `its cwd resolves to '${cwd}'`,
         )
       }
       this.host.rememberSessionPath(sessionId, cwd)
+      validatedPath = cwd
     }
-    await this.mutate(record => record.sessionIds.includes(sessionId)
-      ? record
-      : { ...record, sessionIds: [sessionId, ...record.sessionIds] })
+    await this.mutate((record) => {
+      if (record.sessionIds.includes(sessionId)) return record
+      const sessionIds = [sessionId, ...record.sessionIds]
+      return record.path === validatedPath ? { ...record, sessionIds } : { ...record, path: validatedPath, sessionIds }
+    })
   }
 
   async insertSessionBefore(sessionId: SessionId, beforeSessionId?: SessionId): Promise<void> {
